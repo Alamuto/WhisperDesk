@@ -5,6 +5,7 @@ O nome do módulo é histórico (a v2.1 chamava ffmpeg.exe/ffprobe.exe); a API p
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import shutil
 import subprocess
@@ -18,6 +19,8 @@ from pathlib import Path
 from typing import Callable
 
 import numpy as np
+
+log = logging.getLogger("whisperdesk.media")
 
 SR = 16_000
 OPEN_TIMEOUT_S = 120.0
@@ -183,11 +186,19 @@ def _measure_duration(container, index: int) -> float:
 
 # ---------------------------------------------------------------------------
 # Decodificação + filtros
-def _downmix_filter(stream: AudioStream) -> tuple[str, str]:
-    """Prioriza o canal central (diálogo) em 5.1/6.1/7.1; downmix padrão nos demais."""
-    if stream.channels >= 6 and stream.layout.split("(")[0] in {"5.1", "6.1", "7.1"}:
-        return "pan", "mono|c0<3*FC+FL+FR"   # "<" normaliza: 0,6·FC + 0,2·FL + 0,2·FR, sem decimais (locale)
-    return "aformat", "channel_layouts=mono"
+_PLAIN_DOWNMIX = ("aformat", "channel_layouts=mono")
+
+
+def _downmix_filters(stream: AudioStream | None) -> list[tuple[str, str]]:
+    """Candidatos de downmix, do preferido ao mais simples.
+
+    Em 5.1/6.1/7.1 prioriza o canal central (diálogo): 0,6·FC + 0,2·FL + 0,2·FR ("<" normaliza os
+    pesos 3:1:1). A sintaxe do filtro pan aceita varia entre builds do FFmpeg, então há variantes
+    equivalentes (nome do canal, índice) e, em último caso, o downmix padrão."""
+    if stream and stream.channels >= 6 and stream.layout.split("(")[0] in {"5.1", "6.1", "7.1"}:
+        return [("pan", "mono|FC<3*FC+FL+FR"), ("pan", "mono|c0<3*c2+c0+c1"),
+                ("pan", "1c|c0=0.6*c2+0.2*c0+0.2*c1"), _PLAIN_DOWNMIX]
+    return [_PLAIN_DOWNMIX]
 
 
 class _Pipeline:
@@ -206,6 +217,18 @@ class _Pipeline:
 
     def _build(self, frame):
         av = _av()
+        candidates = _downmix_filters(self.stream)
+        for i, downmix in enumerate(candidates):
+            try:
+                self._build_with(frame, downmix)
+                return
+            except (av.error.FFmpegError, ValueError):
+                if i == len(candidates) - 1:
+                    raise
+                log.debug("downmix %s rejeitado por este FFmpeg; tentando o próximo", downmix)
+
+    def _build_with(self, frame, downmix):
+        av = _av()
         g = av.filter.Graph()
         layout = frame.layout.name if frame.layout is not None else ""
         if not layout or layout == "unknown":
@@ -216,7 +239,7 @@ class _Pipeline:
         if self.async_fill:
             first = ":first_pts=0" if self.first else ""
             nodes.append(g.add("aresample", f"async=1:min_hard_comp=0.100{first}"))
-        nodes.append(g.add(*_downmix_filter(self.stream)) if self.stream else g.add("aformat", "channel_layouts=mono"))
+        nodes.append(g.add(*downmix))
         nodes.append(g.add("aresample", str(self.rate)))
         nodes.append(g.add("aformat", f"sample_fmts={self.sample_fmt}:channel_layouts=mono:sample_rates={self.rate}"))
         nodes.append(g.add("abuffersink"))
