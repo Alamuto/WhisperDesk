@@ -15,6 +15,12 @@ Seu áudio nunca sai do computador.
 ![Versão 2.0.0](https://img.shields.io/badge/vers%C3%A3o-2.0.0-7C5CFF)
 ![Licença MIT](https://img.shields.io/badge/licen%C3%A7a-MIT-informational)
 
+**[⬇ Baixar o instalador (Windows x64)](../../releases/latest)**
+
+<br>
+
+<img src="docs/screenshots/transcript-dark.png" width="900" alt="WhisperDesk mostrando uma transcrição com player de forma de onda, no tema escuro">
+
 </div>
 
 > **English summary** — WhisperDesk is a private, offline desktop transcriber for Windows built on
@@ -96,14 +102,27 @@ A versão 2.0 traz uma interface redesenhada, pensada como produto:
 - Atalhos: `Ctrl+O` abrir, `Ctrl+Enter` transcrever, `Ctrl+E` exportar, `Ctrl+F` buscar, `Ctrl+H` histórico,
   `Ctrl+L` log, `Espaço` / `←` / `→` player, `Esc` fecha gavetas.
 
+| Tela inicial (escuro) | Transcrição (claro) | Histórico (claro) |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/empty-dark.png" width="300" alt="Tela inicial com área para soltar arquivos"> | <img src="docs/screenshots/transcript-light.png" width="300" alt="Transcrição no tema claro"> | <img src="docs/screenshots/history-light.png" width="300" alt="Gaveta de histórico aberta"> |
+
 ## Instalação
 
 1. Baixe `WhisperDesk-2.0.0-setup-x64.exe` na página de [Releases](../../releases).
 2. Execute o instalador (instalação por usuário, não pede administrador).
 3. Abra o WhisperDesk, solte um arquivo e clique em **Transcrever**. O modelo escolhido é baixado na primeira vez.
 
-> O instalador ainda não é assinado digitalmente; o Windows SmartScreen pode exibir "O Windows protegeu o computador".
-> Clique em **Mais informações → Executar assim mesmo**.
+> [!NOTE]
+> **Aviso "O Windows protegeu o computador"**
+>
+> O WhisperDesk é um software novo, gratuito e ainda sem certificado de assinatura pago, por isso o SmartScreen
+> do Windows mostra esse alerta ao abrir o instalador. Para continuar, clique em **Mais informações** e depois em
+> **Executar assim mesmo**.
+>
+> O alerta diminui sozinho: o SmartScreen ganha confiança no arquivo conforme mais pessoas o baixam e executam sem
+> problemas (até programas assinados com certificados comuns passam por isso no início). Se preferir conferir o
+> arquivo antes, compare o SHA-256 dele com o publicado na página da release
+> (`Get-FileHash .\WhisperDesk-2.0.0-setup-x64.exe`) ou leia o código-fonte deste repositório.
 
 **Requisitos**
 
@@ -177,8 +196,9 @@ Inno Setup 6 (`installer\WhisperDesk.iss`, instalação por usuário sem UAC) se
 Saídas: `dist\WhisperDesk\` (pasta portátil, pode ser distribuída em ZIP) e
 `dist\installer\WhisperDesk-2.0.0-setup-x64.exe`.
 
-Recomendado antes de publicar: assinar `WhisperDesk.exe` e o instalador com um certificado de code signing
-(`signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 ...`) para evitar o alerta do SmartScreen.
+Os binários publicados não são assinados (veja a nota em [Instalação](#instalação)). Quem quiser assinar a própria
+build pode usar `signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 ...` no `WhisperDesk.exe` e no
+instalador.
 
 ## Arquitetura
 
