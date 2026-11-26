@@ -1,0 +1,41 @@
+WhisperDesk 2.0.0 - Avisos de terceiros / Third-party notices
+=============================================================
+
+O WhisperDesk distribui os componentes abaixo. Cada um continua sob a sua
+própria licença; os textos completos estão nos links indicados (e, no caso do
+FFmpeg, em bin\FFMPEG-LICENSE.txt).
+
+WhisperDesk ships the components below. Each remains under its own license.
+
+-------------------------------------------------------------------------------
+FFmpeg 9.0.2 (ffmpeg.exe, ffprobe.exe)  -  GNU GPL v3
+  Build estático de https://www.gyan.dev/ffmpeg/builds/ (veja bin\FFMPEG-README.txt)
+  Código-fonte / source: https://github.com/FFmpeg/FFmpeg/commit/946fcce07b
+  Configuração do build e fontes das bibliotecas: https://www.gyan.dev/ffmpeg/builds/
+  O FFmpeg é executado como processo separado; não é ligado ao WhisperDesk.
+  FFmpeg runs as a separate program and is not linked into WhisperDesk.
+
+Qt 6 / PySide6 6.12  -  GNU LGPL v3
+  https://www.qt.io/  -  https://code.qt.io/  -  https://www.gnu.org/licenses/lgpl-3.0.html
+  As bibliotecas Qt estão como DLLs separadas em _internal\PySide6 e podem ser
+  substituídas pelo usuário. Qt libraries are shipped as replaceable DLLs.
+
+CTranslate2 4.8.5  -  MIT  -  https://github.com/OpenNMT/CTranslate2
+faster-whisper 1.2.1  -  MIT  -  https://github.com/SYSTRAN/faster-whisper
+OpenAI Whisper (pesos dos modelos, baixados sob demanda)  -  MIT
+  https://github.com/openai/whisper
+Silero VAD  -  MIT  -  https://github.com/snakers4/silero-vad
+ONNX Runtime 1.31  -  MIT  -  https://github.com/microsoft/onnxruntime
+Hugging Face Hub / tokenizers  -  Apache 2.0  -  https://github.com/huggingface
+NumPy  -  BSD-3-Clause  -  https://numpy.org/
+soundfile / libsndfile  -  BSD-3-Clause / LGPL 2.1  -  https://github.com/bastibe/python-soundfile
+PyAV  -  BSD-3-Clause  -  https://github.com/PyAV-Org/PyAV
+nvidia-ml-py (NVML bindings)  -  BSD-3-Clause
+Python 3.12  -  PSF License  -  https://docs.python.org/3/license.html
+PyInstaller bootloader  -  GPL 2 com exceção de bootloader  -  https://pyinstaller.org/
+
+NVIDIA CUDA Runtime components (cuBLAS, cuBLASLt, cuDNN)
+  Distribuídos conforme a NVIDIA CUDA Toolkit EULA, seção "Distributable Code"
+  (Attachment A). Copyright NVIDIA Corporation.
+  https://docs.nvidia.com/cuda/eula/index.html
+  https://docs.nvidia.com/deeplearning/cudnn/latest/reference/eula.html

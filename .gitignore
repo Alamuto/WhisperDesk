@@ -1,0 +1,23 @@
+# Ambientes Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Saídas de build (geradas por build.bat)
+build/
+build_cache/
+dist/
+bin/
+
+# Dados locais e arquivos pessoais
+transcription.txt
+*.log
+
+# Editores / sistema
+.vscode/
+.idea/
+.claude/
+Thumbs.db
+desktop.ini
