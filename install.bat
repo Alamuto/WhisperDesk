@@ -31,11 +31,6 @@ echo [2/3] Instalando dependencias ...
 )
 
 echo [3/3] Verificando ambiente ...
-where ffmpeg >nul 2>&1
-if errorlevel 1 (
-    echo [AVISO] ffmpeg nao esta no PATH. Para desenvolver, instale:  winget install Gyan.FFmpeg
-    echo         ou coloque ffmpeg.exe/ffprobe.exe em .\bin\
-)
 ".venv\Scripts\python.exe" main.py --selftest
 echo.
 echo Pronto. Execute:  .venv\Scripts\python.exe main.py

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=WhisperDesk
+GenericName=Audio/Video Transcription
+GenericName[pt_BR]=Transcrição de áudio e vídeo
+Comment=Offline transcription of audio and video with Whisper
+Comment[pt_BR]=Transcrição offline de áudio e vídeo com Whisper
+Exec=@APPDIR@/WhisperDesk %f
+Icon=@APPDIR@/_internal/assets/icon.png
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+MimeType=audio/mpeg;audio/x-wav;audio/wav;audio/flac;audio/ogg;audio/mp4;audio/aac;audio/x-m4a;audio/opus;video/mp4;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;
+StartupWMClass=WhisperDesk

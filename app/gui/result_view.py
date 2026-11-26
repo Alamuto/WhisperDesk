@@ -12,14 +12,15 @@ import time
 from collections import OrderedDict
 
 from PySide6.QtCore import (
-    QAbstractListModel, QEvent, QModelIndex, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal,
+    QAbstractListModel, QEasingCurve, QEvent, QModelIndex, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer,
+    QVariantAnimation, Signal,
 )
 from PySide6.QtGui import (
     QAction, QColor, QFont, QFontMetrics, QGuiApplication, QIcon, QKeySequence, QPainter, QShortcut, QTextCharFormat,
     QTextLayout, QTextOption,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemDelegate, QAbstractItemView, QFileDialog, QGraphicsOpacityEffect, QHBoxLayout, QInputDialog,
+    QAbstractItemDelegate, QAbstractItemView, QFileDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QInputDialog,
     QLabel, QLineEdit, QListView, QPlainTextEdit, QToolTip,
     QMessageBox, QPushButton, QSizePolicy, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
 )
@@ -30,6 +31,7 @@ from app.gui.widgets import ElidedLabel, IconButton, IconTile, PulseDot, Reveal,
 from app.pipeline import service
 from app.pipeline.exporters import EXPORT_FORMATS, fmt_short, to_txt
 from app.utils import config as app_config
+from app.utils.desktop import mono_families
 from app.utils.i18n import tr
 
 PAD_V = 8
@@ -38,6 +40,12 @@ GAP = 14
 EDIT_W = 22  # espaço do lápis que aparece ao passar o mouse
 LOW_CONF = 0.50
 MID_CONF = 0.75
+# Bloco de sugestão da revisão contextual (abaixo do texto do trecho)
+SUGG_GAP = 6
+SUGG_PAD = 7
+PILL_H = 22
+PILL_GAP = 6
+SUGG_ICON_W = 22
 
 
 def _norm_words(words) -> list[tuple[int, int, str, float]]:
@@ -51,10 +59,23 @@ def _norm_words(words) -> list[tuple[int, int, str, float]]:
     return out
 
 
+def _changed_spans(original: str, suggestion: str) -> list[tuple[int, int]]:
+    """Faixas de caracteres (na sugestão) das palavras que diferem do original."""
+    from app.pipeline.refine import changed_tokens
+
+    idx = set(changed_tokens(original, suggestion))
+    spans, pos = [], 0
+    for k, tok in enumerate(suggestion.split(" ")):
+        if k in idx:
+            spans.append((pos, pos + len(tok)))
+        pos += len(tok) + 1
+    return spans
+
+
 class _Seg:
     """Segmento pronto para exibição: texto + offsets de cada palavra no texto."""
     __slots__ = ("start_ms", "end_ms", "text", "speaker", "words", "spans", "word_starts", "raw",
-                 "key", "edited", "prefix_len")
+                 "key", "edited", "prefix_len", "sugg_text", "sugg_spans")
 
     def __init__(self, d: dict):
         self.raw = d
@@ -85,6 +106,12 @@ class _Seg:
             self.text = prefix + (d.get("text") or "").strip()
         self.spans = spans
         self.word_starts = [w[0] for w in self.words]
+        self.sugg_text = None
+        self.sugg_spans: list[tuple[int, int]] = []
+        sugg = d.get("suggestion")
+        if sugg and (sugg.get("text") or "").strip():
+            self.sugg_text = " ".join(sugg["text"].split())
+            self.sugg_spans = _changed_spans(self.body, self.sugg_text)
 
     def as_dict(self) -> dict:
         return self.raw
@@ -229,12 +256,16 @@ class SegmentDelegate(QStyledItemDelegate):
         self.show_confidence = True
         self._cache: OrderedDict[tuple[int, int], tuple[QTextLayout, float]] = OrderedDict()
         self._cache_width = -1
+        self.sugg_fade = 1.0  # opacidade dos blocos de sugestão (entrada suave após a revisão)
         self._update_fonts(view.font())
 
     def _update_fonts(self, font: QFont):
         self._font = QFont(font)
+        self._pill_font = QFont(font)
+        self._pill_font.setPointSizeF(max(8.0, font.pointSizeF() - 1))
+        self._pill_font.setWeight(QFont.Weight.DemiBold)
         self._ts_font = QFont(font)
-        self._ts_font.setFamilies(["Cascadia Mono", "Consolas", "Courier New"])
+        self._ts_font.setFamilies(mono_families())
         self._ts_font.setPointSizeF(max(8.0, font.pointSizeF() - 1))
         fm = QFontMetrics(self._ts_font)
         self.ts_width = fm.horizontalAdvance("00:00:00") + PAD_H
@@ -253,15 +284,18 @@ class SegmentDelegate(QStyledItemDelegate):
         return QRectF(r.right() - PAD_H - EDIT_W + 6, r.top() + PAD_V + (self._line_h - 18) / 2, 18, 18)
 
     def _layout(self, row: int, seg: _Seg, width: int) -> tuple[QTextLayout, float]:
-        if width != self._cache_width:
+        return self._layout_text(row, seg.text, width)
+
+    def _layout_text(self, row: int, text: str, width: int, tag: str = "") -> tuple[QTextLayout, float]:
+        if tag == "" and width != self._cache_width:
             self._cache.clear()
             self._cache_width = width
-        key = (row, seg.text)
+        key = (row, tag + text, width)
         hit = self._cache.get(key)
         if hit is not None:
             self._cache.move_to_end(key)
             return hit
-        lay = QTextLayout(seg.text, self._font)
+        lay = QTextLayout(text, self._font)
         opt = QTextOption()
         opt.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
         lay.setTextOption(opt)
@@ -281,11 +315,88 @@ class SegmentDelegate(QStyledItemDelegate):
             self._cache.popitem(last=False)
         return res
 
+    # ---- bloco de sugestão ---------------------------------------------
+    def _pill_widths(self) -> tuple[int, int]:
+        fm = QFontMetrics(self._pill_font)
+        return fm.horizontalAdvance(tr("accept")) + 22, fm.horizontalAdvance(tr("keep")) + 22
+
+    def _sugg_geom(self, r: QRect, row: int, seg: _Seg, main_h: float) -> dict:
+        """Geometria do bloco de sugestão de uma linha (em coordenadas do viewport)."""
+        tw = self._text_width(r.width())
+        text_x = r.left() + PAD_H + self.ts_width + GAP
+        bx = text_x - 8
+        bw = tw + EDIT_W + 8
+        by = r.top() + PAD_V + main_h + SUGG_GAP
+        acc_w, rej_w = self._pill_widths()
+        sw = max(60, int(bw - 8 - SUGG_ICON_W - acc_w - PILL_GAP - rej_w - 12 - 8))
+        lay, sh = self._layout_text(row, seg.sugg_text, sw, tag="\x00s")
+        bh = max(sh, PILL_H) + 2 * SUGG_PAD
+        py = by + SUGG_PAD + (self._line_h - PILL_H) / 2
+        rej = QRectF(bx + bw - 8 - rej_w, py, rej_w, PILL_H)
+        acc = QRectF(rej.left() - PILL_GAP - acc_w, py, acc_w, PILL_H)
+        return {
+            "block": QRectF(bx, by, bw, bh), "layout": lay,
+            "text_pos": QPointF(bx + 8 + SUGG_ICON_W, by + SUGG_PAD),
+            "icon": QRectF(bx + 8, by + SUGG_PAD + (self._line_h - 16) / 2, 16, 16),
+            "accept": acc, "reject": rej,
+        }
+
+    def _sugg_height(self, row: int, seg: _Seg, width: int) -> int:
+        if not seg.sugg_text:
+            return 0
+        g = self._sugg_geom(QRect(0, 0, width, 100), row, seg, 0)
+        return int(SUGG_GAP + g["block"].height())
+
     def sizeHint(self, option, index):
         seg: _Seg = index.data(SegmentModel.SegRole)
-        w = self._text_width(self._view.viewport().width())
+        vw = self._view.viewport().width()
+        w = self._text_width(vw)
         _lay, h = self._layout(index.row(), seg, w)
-        return QSize(self._view.viewport().width(), int(h) + 2 * PAD_V)
+        return QSize(vw, int(h) + 2 * PAD_V + self._sugg_height(index.row(), seg, vw))
+
+    def _paint_suggestion(self, painter: QPainter, r: QRect, row: int, seg: _Seg, main_h: float):
+        c = self.colors
+        g = self._sugg_geom(r, row, seg, main_h)
+        painter.save()
+        painter.setOpacity(self.sugg_fade)
+        accent = QColor(c["accent"])
+        fill = QColor(accent)
+        fill.setAlphaF(0.08)
+        edge = QColor(accent)
+        edge.setAlphaF(0.30)
+        painter.setPen(edge)
+        painter.setBrush(fill)
+        painter.drawRoundedRect(g["block"].adjusted(0.5, 0.5, -0.5, -0.5), 8, 8)
+        icons.draw(painter, "sparkle", g["icon"], c["accent_fg"], 1.6)
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(c["accent_fg"]))
+        fmt.setFontWeight(QFont.Weight.DemiBold)
+        formats = [_range(a, b - a, fmt) for a, b in seg.sugg_spans]
+        painter.setPen(QColor(c["text"]))
+        painter.setFont(self._font)
+        g["layout"].draw(painter, g["text_pos"], formats)
+        hot = self._view.hover_pill if self._view.hover_pill and self._view.hover_pill[0] == row else None
+        painter.setFont(self._pill_font)
+        # Aceitar: preenchido; Manter: contorno discreto.
+        ar = g["accept"]
+        bg = QColor(accent)
+        if not (hot and hot[1] == "accept"):
+            bg.setAlphaF(0.88)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(bg)
+        painter.drawRoundedRect(ar, PILL_H / 2, PILL_H / 2)
+        painter.setPen(QColor("#FFFFFF"))
+        painter.drawText(ar, int(Qt.AlignmentFlag.AlignCenter), tr("accept"))
+        rr = g["reject"]
+        on = bool(hot and hot[1] == "reject")
+        edge2 = QColor(c["muted"])
+        edge2.setAlphaF(0.40)
+        painter.setPen(edge2 if not on else Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(c["hover"]) if on else Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(rr.adjusted(0.5, 0.5, -0.5, -0.5), PILL_H / 2, PILL_H / 2)
+        painter.setPen(QColor(c["text"] if on else c["muted"]))
+        painter.drawText(rr, int(Qt.AlignmentFlag.AlignCenter), tr("keep"))
+        painter.restore()
 
     def paint(self, painter: QPainter, option, index):
         model: SegmentModel = index.model()
@@ -367,6 +478,8 @@ class SegmentDelegate(QStyledItemDelegate):
         painter.setPen(QColor(c["text"]))
         painter.setFont(self._font)
         lay.draw(painter, QPointF(r.left() + PAD_H + self.ts_width + GAP, r.top() + PAD_V), formats)
+        if seg.sugg_text:
+            self._paint_suggestion(painter, r, row, seg, _h)
         if hover and model.editable and seg.key is not None and self._view.state() != QAbstractItemView.State.EditingState:
             er = self._edit_rect(r)
             hot = self._view.hover_edit_row == row
@@ -421,6 +534,16 @@ class SegmentDelegate(QStyledItemDelegate):
     def helpEvent(self, event, view, option, index):  # noqa: N802
         if event.type() == QEvent.Type.ToolTip and index.isValid():
             seg: _Seg = index.data(SegmentModel.SegRole)
+            if seg.sugg_text:
+                g = self._sugg_geom(option.rect, index.row(), seg,
+                                    self._layout(index.row(), seg, self._text_width(option.rect.width()))[1])
+                if g["block"].contains(QPointF(event.pos())):
+                    sw = _norm_words((seg.raw.get("suggestion") or {}).get("words"))
+                    old = sum(w[3] for w in seg.words) / len(seg.words) if seg.words else 0.0
+                    new = sum(w[3] for w in sw) / len(sw) if sw else 0.0
+                    QToolTip.showText(event.globalPos(), tr("suggestion_tip", old=round(old * 100),
+                                                            new=round(new * 100), original=seg.body), view)
+                    return True
             x = event.pos().x() - option.rect.left()
             if seg.edited and x < PAD_H + self.ts_width:
                 QToolTip.showText(event.globalPos(), tr("edited_tip"), view)
@@ -428,9 +551,22 @@ class SegmentDelegate(QStyledItemDelegate):
         return super().helpEvent(event, view, option, index)
 
     def hit_test(self, index, pos) -> tuple[str, int] | None:
-        """('ts'|'word'|'edit', ms) para o ponto clicado."""
+        """('ts'|'word'|'edit'|'accept'|'reject'|'sugg', ms) para o ponto clicado."""
         seg: _Seg = index.data(SegmentModel.SegRole)
         r = self._view.visualRect(index)
+        if seg.sugg_text:
+            main_h = self._layout(index.row(), seg, self._text_width(r.width()))[1]
+            g = self._sugg_geom(r, index.row(), seg, main_h)
+            pf = QPointF(pos)
+            if index.model().editable:
+                if g["accept"].adjusted(-3, -3, 3, 3).contains(pf):
+                    return ("accept", seg.start_ms)
+                if g["reject"].adjusted(-3, -3, 3, 3).contains(pf):
+                    return ("reject", seg.start_ms)
+            if g["block"].contains(pf):
+                return ("sugg", seg.start_ms)
+            if pos.y() > g["block"].top() - SUGG_GAP:
+                return ("ts", seg.start_ms)
         if (index.model().editable and seg.key is not None
                 and self._edit_rect(r).adjusted(-5, -5, 5, 5).contains(QPointF(pos))):
             return ("edit", seg.start_ms)
@@ -488,11 +624,13 @@ def _range(start: int, length: int, fmt: QTextCharFormat):
 
 class _ListView(QListView):
     seek_requested = Signal(int)  # ms
+    suggestion_resolved = Signal(int, bool)  # linha, aceitar
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.last_user_scroll = 0.0
         self.hover_edit_row = -1
+        self.hover_pill: tuple[int, str] | None = None
         self.setObjectName("resultList")
         self.setEditTriggers(QAbstractItemView.EditTrigger.EditKeyPressed)
         self.setUniformItemSizes(False)
@@ -513,14 +651,18 @@ class _ListView(QListView):
         idx = self.indexAt(e.position().toPoint())
         cursor = Qt.CursorShape.ArrowCursor
         edit_row = -1
+        pill = None
         if idx.isValid():
             hit = self.itemDelegate().hit_test(idx, e.position().toPoint())
-            if hit and hit[0] in ("ts", "edit"):
+            if hit and hit[0] in ("ts", "edit", "accept", "reject"):
                 cursor = Qt.CursorShape.PointingHandCursor
             if hit and hit[0] == "edit":
                 edit_row = idx.row()
-        if edit_row != self.hover_edit_row:
+            if hit and hit[0] in ("accept", "reject"):
+                pill = (idx.row(), hit[0])
+        if edit_row != self.hover_edit_row or pill != self.hover_pill:
             self.hover_edit_row = edit_row
+            self.hover_pill = pill
             self.viewport().update()
         self.viewport().setCursor(cursor)
         super().mouseMoveEvent(e)
@@ -534,6 +676,10 @@ class _ListView(QListView):
                 self.setCurrentIndex(idx)
                 self.edit(idx)
                 return
+            if hit and hit[0] in ("accept", "reject"):
+                self.setCurrentIndex(idx)
+                self.suggestion_resolved.emit(idx.row(), hit[0] == "accept")
+                return
             if hit and hit[0] == "ts":
                 self.seek_requested.emit(hit[1])
         super().mousePressEvent(e)
@@ -542,7 +688,7 @@ class _ListView(QListView):
         idx = self.indexAt(e.position().toPoint())
         if idx.isValid():
             hit = self.itemDelegate().hit_test(idx, e.position().toPoint())
-            if hit and hit[0] == "edit":
+            if hit and hit[0] in ("edit", "accept", "reject"):
                 return
             if hit:
                 self.seek_requested.emit(hit[1])
@@ -550,8 +696,9 @@ class _ListView(QListView):
         super().mouseDoubleClickEvent(e)
 
     def leaveEvent(self, e):
-        if self.hover_edit_row != -1:
+        if self.hover_edit_row != -1 or self.hover_pill is not None:
             self.hover_edit_row = -1
+            self.hover_pill = None
             self.viewport().update()
         super().leaveEvent(e)
 
@@ -568,6 +715,7 @@ class _ListView(QListView):
 class ResultView(QWidget):
     timestamp_clicked = Signal(float)
     diarize_requested = Signal(str)  # job_id
+    refine_requested = Signal(str)  # job_id
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -654,6 +802,9 @@ class ResultView(QWidget):
         self._diar_act = self._more_menu.addAction(tr("identify_speakers"))
         self._diar_act.setToolTip(tr("identify_speakers_tip"))
         self._diar_act.triggered.connect(lambda: self._job_id and self.diarize_requested.emit(self._job_id))
+        self._refine_act = self._more_menu.addAction(tr("review_doubtful"))
+        self._refine_act.setToolTip(tr("review_doubtful_tip"))
+        self._refine_act.triggered.connect(lambda: self._job_id and self.refine_requested.emit(self._job_id))
         self._edit_act = self._more_menu.addAction(tr("edit_segment"))
         self._edit_act.setShortcut(QKeySequence(Qt.Key.Key_F2))
         self._edit_act.triggered.connect(self.edit_current)
@@ -664,6 +815,37 @@ class ResultView(QWidget):
             lambda: self._more_menu.exec(self._more_btn.mapToGlobal(self._more_btn.rect().bottomLeft())))
         head.addWidget(self._more_btn)
         layout.addLayout(head)
+
+        # Banner das sugestões da revisão contextual
+        self._sugg_frame = QFrame()
+        self._sugg_frame.setObjectName("suggestBanner")
+        sb = QHBoxLayout(self._sugg_frame)
+        sb.setContentsMargins(10, 5, 6, 5)
+        sb.setSpacing(6)
+        self._sugg_icon = QLabel()
+        sb.addWidget(self._sugg_icon)
+        self._sugg_label = ElidedLabel("")
+        self._sugg_label.setMinimumWidth(0)
+        self._sugg_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        sb.addWidget(self._sugg_label, 1)
+        self._sugg_prev = IconButton("chevron-up", tr("prev_suggestion"), 28, 15)
+        self._sugg_prev.clicked.connect(lambda: self._goto_suggestion(-1))
+        sb.addWidget(self._sugg_prev)
+        self._sugg_next = IconButton("chevron-down", tr("next_suggestion"), 28, 15)
+        self._sugg_next.clicked.connect(lambda: self._goto_suggestion(1))
+        sb.addWidget(self._sugg_next)
+        self._sugg_keep_all = QPushButton(tr("keep_all"))
+        self._sugg_keep_all.setObjectName("ghost")
+        self._sugg_keep_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._sugg_keep_all.clicked.connect(self.reject_all_suggestions)
+        sb.addWidget(self._sugg_keep_all)
+        self._sugg_accept_all = QPushButton(tr("accept_all"))
+        self._sugg_accept_all.setObjectName("accentSoft")
+        self._sugg_accept_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._sugg_accept_all.clicked.connect(self.accept_all_suggestions)
+        sb.addWidget(self._sugg_accept_all)
+        self._sugg_reveal = Reveal(self._sugg_frame, shown=False)
+        layout.addWidget(self._sugg_reveal)
 
         self._model = SegmentModel(self)
         self._view = _ListView(self)
@@ -676,6 +858,7 @@ class ResultView(QWidget):
         self._view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._view.customContextMenuRequested.connect(self._on_context_menu)
         self._model.edit_committed.connect(self._on_edit_committed)
+        self._view.suggestion_resolved.connect(self._resolve_row)
         layout.addWidget(self._view, stretch=1)
 
         # Linha provisória do modo ao vivo (o que está sendo dito agora)
@@ -723,6 +906,8 @@ class ResultView(QWidget):
         self._partial.setStyleSheet(f"QLabel#partialLine {{ color: {t['text3']}; font-style: italic; }}")
         self._search_act.setIcon(icons.icon("search", theme.tokens()["text3"], 16))
         self._export_btn.setIcon(icons.icon("download", theme.tokens()["accent_fg"], 16, 2.0))
+        self._sugg_icon.setPixmap(icons.icon("sparkle", t["accent_fg"], 16).pixmap(16, 16))
+        self._sugg_label.setStyleSheet(f"color: {t['accent_fg']}; font-weight: 600;")
         self.set_theme(name)
 
     def _build_export_menu(self):
@@ -740,6 +925,13 @@ class ResultView(QWidget):
         self._clear_act.setText(tr("clear"))
         self._diar_act.setToolTip(tr("identify_speakers_tip"))
         self._edit_act.setText(tr("edit_segment"))
+        self._refine_act.setToolTip(tr("review_doubtful_tip"))
+        self._sugg_prev.setToolTip(tr("prev_suggestion"))
+        self._sugg_next.setToolTip(tr("next_suggestion"))
+        self._sugg_keep_all.setText(tr("keep_all"))
+        self._sugg_accept_all.setText(tr("accept_all"))
+        self._delegate.invalidate()
+        self._view.scheduleDelayedItemsLayout()
         self._copy_btn.setToolTip(tr("copy_all"))
         self._more_btn.setToolTip(tr("more_options"))
         self._prev_btn.setToolTip(tr("prev_match"))
@@ -796,10 +988,13 @@ class ResultView(QWidget):
         elif self._partial_reveal.is_shown():
             self._partial_reveal.set_shown(False)
 
-    def show_job(self, job_id: str, segments: list[dict], title: str | None = None):
+    def show_job(self, job_id: str, segments: list[dict], title: str | None = None,
+                 fade_suggestions: bool = False):
         self._job_id = job_id
         self._live = False
         self._model.set_segments(segments)
+        if fade_suggestions and any(s.get("suggestion") for s in segments):
+            self._fade_in_suggestions()
         self._delegate.invalidate()
         self._reset_search()
         self._update_state()
@@ -843,9 +1038,14 @@ class ResultView(QWidget):
         self._edit_act.setEnabled(self._model.editable)
         self._diar_act.setVisible(has_job and not self._live and not self._job_id.startswith("legacy-"))
         self._diar_act.setEnabled(has_job and not self._live)
+        self._refine_act.setVisible(self._diar_act.isVisible())
+        self._refine_act.setEnabled(has_job and not self._live)
         if has_job:
             diarized = bool(self._model.speakers())
             self._diar_act.setText(tr("redo_speakers") if diarized else tr("identify_speakers"))
+            self._refine_act.setText(tr("review_again") if service.is_refined(self._job_id)
+                                     else tr("review_doubtful"))
+        self._update_suggestions()
         self._export_btn.setEnabled(has_job and not self._live)
         self._copy_btn.setEnabled(n > 0)
         self._clear_act.setEnabled(n > 0 and not self._live)
@@ -958,6 +1158,12 @@ class ResultView(QWidget):
             seg = self._model.seg(row)
             menu.addAction(tr("play_from_here"), lambda: self.timestamp_clicked.emit(seg.start_ms / 1000.0))
             menu.addAction(tr("copy_selection"), self.copy_text)
+            if self._model.editable and seg.key is not None and seg.sugg_text:
+                menu.addSeparator()
+                menu.addAction(icons.icon("check", theme.tokens()["text2"], 16), tr("accept_suggestion"),
+                               lambda: self._resolve_row(row, True))
+                menu.addAction(icons.icon("close", theme.tokens()["text2"], 16), tr("keep_original"),
+                               lambda: self._resolve_row(row, False))
             if self._model.editable and seg.key is not None:
                 menu.addSeparator()
                 menu.addAction(icons.icon("pencil", theme.tokens()["text2"], 16), tr("edit_segment"),
@@ -1034,6 +1240,94 @@ class ResultView(QWidget):
             self._model.replace_row(row, new)
             self._relayout_row(row)
             self._toast(tr("segment_restored"), "info")
+
+    # ------------------------------------------------- revisão contextual
+    def _suggestion_rows(self) -> list[int]:
+        return [i for i in range(self._model.rowCount()) if self._model.seg(i).sugg_text]
+
+    def suggestion_total(self) -> int:
+        return len(self._suggestion_rows())
+
+    def _update_suggestions(self):
+        rows = self._suggestion_rows() if (self._model.editable and self._job_id) else []
+        n = len(rows)
+        if n:
+            self._sugg_label.setText(tr("suggestions_banner_one") if n == 1 else tr("suggestions_banner", count=n))
+            self._sugg_prev.setVisible(n > 1)
+            self._sugg_next.setVisible(n > 1)
+        if bool(n) != self._sugg_reveal.is_shown():
+            self._sugg_reveal.set_shown(bool(n))
+
+    def _fade_in_suggestions(self):
+        anim = QVariantAnimation(self)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setDuration(420)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        def step(v):
+            self._delegate.sugg_fade = float(v)
+            self._view.viewport().update()
+
+        anim.valueChanged.connect(step)
+        self._delegate.sugg_fade = 0.0
+        anim.start(QVariantAnimation.DeletionPolicy.DeleteWhenStopped)
+
+    def _goto_suggestion(self, step: int):
+        rows = self._suggestion_rows()
+        if not rows:
+            return
+        cur = self._view.currentIndex().row() if self._view.currentIndex().isValid() else -1
+        if step > 0:
+            nxt = next((r for r in rows if r > cur), rows[0])
+        else:
+            nxt = next((r for r in reversed(rows) if r < cur), rows[-1])
+        idx = self._model.index(nxt)
+        self._view.scrollTo(idx, QAbstractItemView.ScrollHint.PositionAtCenter)
+        self._view.setCurrentIndex(idx)
+        self._sugg_label.setText(tr("suggestions_banner_pos", pos=rows.index(nxt) + 1, count=len(rows)))
+
+    def _resolve_row(self, row: int, accept: bool):
+        seg = self._model.seg(row)
+        if not self._job_id or seg.key is None or not seg.sugg_text:
+            return
+        try:
+            new = (service.accept_suggestion if accept else service.reject_suggestion)(self._job_id, seg.key)
+        except Exception as e:  # noqa: BLE001 — mostrado ao usuário
+            self._toast(f"{tr('edit_failed')}: {e}", "error", 5000)
+            return
+        if new is not None:
+            self._model.replace_row(row, new)
+            self._relayout_row(row)
+            if accept:
+                self._toast(tr("suggestion_accepted"))
+
+    def _reload_rows(self):
+        """Recarrega do journal mantendo a posição de rolagem."""
+        sb = self._view.verticalScrollBar()
+        pos = sb.value()
+        self._model.set_segments(service.load_segments(self._job_id))
+        self._delegate.invalidate()
+        if self._model.query:
+            self._recompute_matches()
+        self._update_state()
+        QTimer.singleShot(0, lambda: sb.setValue(pos))
+
+    def accept_all_suggestions(self):
+        if not self._job_id:
+            return
+        n = service.accept_all_suggestions(self._job_id)
+        self._reload_rows()
+        if n:
+            self._toast(tr("suggestions_accepted_all", count=n))
+
+    def reject_all_suggestions(self):
+        if not self._job_id:
+            return
+        n = service.reject_all_suggestions(self._job_id)
+        self._reload_rows()
+        if n:
+            self._toast(tr("suggestions_kept_all", count=n), "info")
 
     def _ask_name(self, title: str, label: str, text: str = "") -> str | None:
         name, ok = QInputDialog.getText(self, title, label, QLineEdit.EchoMode.Normal, text)

@@ -2,7 +2,7 @@
 ; Instala por usuário (sem UAC) por padrão; o usuário pode optar por "todos os usuários".
 
 #define AppName "WhisperDesk"
-#define AppVersion "2.1.0"
+#define AppVersion "2.2.0"
 #define AppExe "WhisperDesk.exe"
 #define SrcDir "..\dist\WhisperDesk"
 

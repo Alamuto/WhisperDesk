@@ -35,7 +35,8 @@ def close() -> None:
 
 
 JOB_CONFIG_KEYS = ("model_size", "language", "task", "device", "compute_type", "vad_filter",
-                   "beam_size", "temperature", "audio_stream", "diarize", "num_speakers", "speaker_label")
+                   "beam_size", "temperature", "audio_stream", "diarize", "num_speakers", "speaker_label",
+                   "refine")
 
 
 def create_or_resume_job(src_path: str, cfg: dict, audio_stream: int, media_duration: float | None) -> tuple[str, str]:
@@ -227,8 +228,12 @@ def _segment(job_id: str, key: tuple[int, int]) -> dict:
     words = [tuple(w) for w in j.conn.execute(
         "SELECT start_ms, end_ms, word, prob FROM word WHERE job_id=? AND chunk_idx=? AND seg_seq=? ORDER BY seq",
         (job_id, ci, sq))]
-    return {"start_ms": r[0], "end_ms": r[1], "text": r[2], "avg_logprob": r[3], "speaker": r[4],
-            "words": words, "key": (ci, sq), "edited": r[5] is not None}
+    out = {"start_ms": r[0], "end_ms": r[1], "text": r[2], "avg_logprob": r[3], "speaker": r[4],
+           "words": words, "key": (ci, sq), "edited": r[5] is not None}
+    sugg = j.suggestions(job_id).get((ci, sq))
+    if sugg is not None:
+        out["suggestion"] = sugg
+    return out
 
 
 def speakers(job_id: str) -> list[str]:
@@ -246,3 +251,43 @@ def set_segment_speaker(job_id: str, key: tuple[int, int], speaker: str | None) 
 def is_diarized(job_id: str) -> bool:
     row = journal().job(job_id)
     return bool(row is not None and row["diarized"])
+
+
+# ---------------------------------------------------------------------------
+# Revisão contextual (sugestões para trechos de baixa confiança)
+def suggestion_count(job_id: str) -> int:
+    return len(journal().suggestions(job_id))
+
+
+def is_refined(job_id: str) -> bool:
+    row = journal().job(job_id)
+    return bool(row is not None and row["refined"])
+
+
+def accept_suggestion(job_id: str, key: tuple[int, int]) -> dict | None:
+    """Aplica a sugestão como edição (o original continua restaurável). Devolve o trecho atualizado."""
+    if not journal().resolve_suggestion(job_id, key, accept=True):
+        return None
+    return _segment(job_id, key)
+
+
+def reject_suggestion(job_id: str, key: tuple[int, int]) -> dict | None:
+    if not journal().resolve_suggestion(job_id, key, accept=False):
+        return None
+    return _segment(job_id, key)
+
+
+def accept_all_suggestions(job_id: str) -> int:
+    j = journal()
+    n = 0
+    for key in list(j.suggestions(job_id)):
+        n += bool(j.resolve_suggestion(job_id, key, accept=True))
+    return n
+
+
+def reject_all_suggestions(job_id: str) -> int:
+    j = journal()
+    n = 0
+    for key in list(j.suggestions(job_id)):
+        n += bool(j.resolve_suggestion(job_id, key, accept=False))
+    return n

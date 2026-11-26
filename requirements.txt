@@ -1,4 +1,4 @@
-# Dependências de execução (versões validadas no build 2.0.0, Python 3.12, Windows x64).
+# Dependências de execução (versões validadas no build 2.2.0, Python 3.12; Windows x64, Linux x64, macOS).
 PySide6-Essentials==6.12.0
 PySide6-Addons==6.12.0
 faster-whisper==1.2.1
@@ -9,7 +9,7 @@ tokenizers==0.23.3
 numpy==2.5.4
 soundfile==0.14.0
 nvidia-ml-py==13.615.71
-# cuBLAS para CUDA 12 (o cuDNN que o CTranslate2 usa já vem no wheel dele).
-nvidia-cublas-cu12==12.9.2.10
-# O áudio é decodificado pelo ffmpeg (subprocesso); PyAV só é dependência transitiva do faster-whisper.
+# Mídia: PyAV traz as bibliotecas do FFmpeg na própria wheel (sem ffmpeg.exe/ffprobe.exe).
 av==19.0.2
+# As bibliotecas CUDA (cuBLAS/cuDNN) NÃO vão no pacote: o app baixa sob demanda (app/gpu_pack.py).
+# Para usar GPU em desenvolvimento sem baixar pelo app:  pip install -r requirements-gpu.txt

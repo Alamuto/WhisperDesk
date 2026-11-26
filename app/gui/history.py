@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import time
 
 from PySide6.QtCore import QEvent, QModelIndex, QRect, QRectF, QSize, Qt, Signal
@@ -192,14 +191,16 @@ def _context_menu(owner: QWidget, item: QListWidgetItem, global_pos, on_load, on
     t = theme.tokens()
     act_load = menu.addAction(icons.icon("play", t["text2"], 16), tr("load"))
     act_folder = menu.addAction(icons.icon("folder", t["text2"], 16), tr("show_in_folder"))
-    act_folder.setEnabled(os.path.isfile(src) and os.name == "nt")
+    act_folder.setEnabled(os.path.isfile(src))
     menu.addSeparator()
     act_del = menu.addAction(icons.icon("trash", t["danger"], 16), tr("delete"))
     action = menu.exec(global_pos)
     if action == act_load:
         on_load(jid)
     elif action == act_folder:
-        subprocess.Popen(["explorer", "/select,", os.path.normpath(src)])
+        from app.utils.desktop import reveal_file
+
+        reveal_file(src)
     elif action == act_del:
         name = item.data(R_NAME) or ""
         if QMessageBox.question(owner, tr("delete"), tr("delete_entry_msg", name=name)) \

@@ -167,6 +167,11 @@ class ConfigPanel(QWidget):
         self._diar_row.toggled.connect(lambda on: self._spk_reveal.set_shown(on))
         lay.addLayout(spk)
 
+        # Revisão contextual dos trechos de baixa confiança
+        self._refine_row = SwitchRow(tr("refine"), tr("refine_desc"))
+        self._refine_row.setToolTip(tr("refine_tip"))
+        lay.addWidget(self._refine_row)
+
         # Avançado
         self._advanced = Collapsible(tr("advanced"))
         cl = self._advanced.content_layout
@@ -232,6 +237,13 @@ class ConfigPanel(QWidget):
         self._lang_combo.setCurrentIndex(max(0, i))
         self._lang_combo.blockSignals(False)
 
+    def set_cuda_available(self, ok: bool):
+        """Chamado quando o pacote GPU termina de instalar: libera a opção GPU e a seleciona."""
+        self._cuda = ok
+        self._device_seg.set_option_enabled("cuda", ok, "" if ok else tr("gpu_cpu_mode"))
+        if ok:
+            self._device_seg.set_current("cuda")
+
     def retranslate(self):
         self._model_label.setText(tr("model"))
         self._lang_label.setText(tr("language"))
@@ -243,6 +255,8 @@ class ConfigPanel(QWidget):
             self._device_seg.set_option_enabled("cuda", False, tr("gpu_cpu_mode"))
         self._diar_row.set_texts(tr("diarize"), tr("diarize_desc"))
         self._diar_row.setToolTip(tr("diarize_tip"))
+        self._refine_row.set_texts(tr("refine"), tr("refine_desc"))
+        self._refine_row.setToolTip(tr("refine_tip"))
         self._spk_label.setText(tr("num_speakers"))
         self._spk_seg.set_labels([tr("auto_short"), "2", "3", "4", "5"])
         self._spk_seg.setToolTip(tr("num_speakers_tip"))
@@ -283,6 +297,7 @@ class ConfigPanel(QWidget):
         self._beam_spin.setValue(int(cfg.get("beam_size", 5)))
         self._temp_spin.setValue(float(cfg.get("temperature", 0.0)))
         self._apply_speakers(cfg, animate=False)
+        self._refine_row.setChecked(bool(cfg.get("refine", True)))
         self._on_model_changed()
 
     def _apply_speakers(self, cfg: dict, animate: bool = True):
@@ -305,6 +320,7 @@ class ConfigPanel(QWidget):
             "diarize": self._diar_row.isChecked(),
             "num_speakers": int(self._spk_seg.current()) if self._diar_row.isChecked() else 0,
             "speaker_label": tr("speaker_n"),
+            "refine": self._refine_row.isChecked(),
         }
 
     def _populate_models(self):
@@ -379,7 +395,7 @@ class ConfigPanel(QWidget):
         self._is_transcribing = active
         for w in (self._model_combo, self._lang_combo, self._task_seg, self._device_seg,
                   self._compute_combo, self._vad_row, self._beam_spin, self._temp_spin,
-                  self._diar_row, self._spk_seg):
+                  self._diar_row, self._spk_seg, self._refine_row):
             w.setEnabled(not active)
         self._update_button()
 
@@ -397,6 +413,7 @@ class ConfigPanel(QWidget):
         self._beam_spin.setValue(int(cfg.get("beam_size") or 5))
         self._temp_spin.setValue(float(cfg.get("temperature") or 0.0))
         self._apply_speakers(cfg)
+        self._refine_row.setChecked(bool(cfg.get("refine", True)))
         self._on_model_changed()
 
     def _on_start(self):

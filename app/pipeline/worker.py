@@ -202,6 +202,29 @@ class Engine:
         return out, info
 
 
+def _refine_decode(engine: "Engine", audio, language, task, prompt, hotwords) -> list:
+    """Decodificação cuidadosa de uma janela curta (revisão contextual): beam maior, sem VAD."""
+    engine._ensure_loaded()
+    beam = engine.step[3]
+    segments, _info = engine._model.transcribe(
+        audio,
+        language=language,
+        task=task,
+        beam_size=8 if beam >= 5 else beam,
+        best_of=5,
+        word_timestamps=True,
+        temperature=(0.0, 0.2, 0.4),
+        compression_ratio_threshold=2.4,
+        log_prob_threshold=-1.0,
+        no_speech_threshold=0.6,
+        initial_prompt=prompt,
+        hotwords=hotwords,
+        condition_on_previous_text=False,
+        vad_filter=False,
+    )
+    return list(segments)
+
+
 def _free_vram_mb() -> int | None:
     try:
         import pynvml
@@ -321,20 +344,25 @@ def _run(j: Journal, job_id: str, models_dir: Path, emit, cancel_event) -> None:
     workdir = j.workdir(job_id)
 
     if job["state"] in ("DONE",):
-        # Job concluído reaberto só para identificar falantes (diarização posterior).
+        # Job concluído reaberto só para etapas posteriores (revisão contextual, falantes).
         # O resultado já está pronto: cancelar ou falhar aqui nunca muda o estado DONE.
-        if cfg.get("diarize") and not job["diarized"]:
+        want_refine = bool(cfg.get("refine")) and not job["refined"]
+        want_diar = bool(cfg.get("diarize")) and not job["diarized"]
+        if want_refine or want_diar:
             wav = None
             try:
                 wav = Path(job["wav_path"]) if job["wav_path"] else None
                 if not (wav and wav.is_file()):
                     wav = _extract_only(job, workdir, emit, cancel_event)
-                _diarize_stage(j, job_id, str(wav), cfg, models_dir, emit, cancel_event, persist_state=False)
+                if want_refine:
+                    _refine_stage(j, job_id, str(wav), cfg, models_dir, emit, cancel_event, persist_state=False)
+                if want_diar:
+                    _diarize_stage(j, job_id, str(wav), cfg, models_dir, emit, cancel_event, persist_state=False)
             except (Cancelled, InterruptedError):
-                emit("log", "Identificação de falantes cancelada.")
+                emit("log", "Etapa cancelada; o resultado continua como estava.")
             except Exception as e:
-                log.exception("Diarização posterior falhou")
-                emit("warning", f"Não foi possível identificar os falantes: {e}")
+                log.exception("Etapa posterior falhou")
+                emit("warning", f"Não foi possível concluir a etapa: {e}")
             finally:
                 _drop_wav(str(wav) if wav else None)
         emit("done", {"failed_chunks": len(j.failed_chunks(job_id)),
@@ -507,17 +535,25 @@ def _run(j: Journal, job_id: str, models_dir: Path, emit, cancel_event) -> None:
                              for n, s in enumerate(segments)],
             })
             del audio, raw, segments
+    except BaseException:
+        if engine is not None:
+            engine.close()
+        raise
+
+    try:
+        if cancel_event.is_set():
+            raise Cancelled()
+
+        # ---- FINALIZAÇÃO ----
+        failed = j.failed_chunks(job_id)
+        for c in failed:
+            j.add_warning(job_id, f"Trecho {_fmt_s(c['start_sample'])}–{_fmt_s(c['end_sample'])} não foi transcrito.")
+        if cfg.get("refine") and not j.job(job_id)["refined"]:
+            # Reaproveita o modelo já carregado; a VRAM é liberada antes da diarização.
+            _refine_stage(j, job_id, job["wav_path"], cfg, models_dir, emit, cancel_event, engine=engine)
     finally:
         if engine is not None:
             engine.close()
-
-    if cancel_event.is_set():
-        raise Cancelled()
-
-    # ---- FINALIZAÇÃO ----
-    failed = j.failed_chunks(job_id)
-    for c in failed:
-        j.add_warning(job_id, f"Trecho {_fmt_s(c['start_sample'])}–{_fmt_s(c['end_sample'])} não foi transcrito.")
     if cfg.get("diarize") and not j.job(job_id)["diarized"]:
         _diarize_stage(j, job_id, job["wav_path"], cfg, models_dir, emit, cancel_event)
     j.set_state(job_id, "DONE")
@@ -548,6 +584,65 @@ def _extract_only(job, workdir: Path, emit, cancel_event) -> Path:
     ffmpeg_tools.extract_wav(job["src_path"], wav, stream, info.duration, cancel_event=cancel_event,
                              on_progress=lambda f: emit("extract_progress", f), log_path=workdir / "ffmpeg.log")
     return wav
+
+
+def _refine_stage(j: Journal, job_id: str, wav_path: str, cfg: dict, models_dir: Path, emit, cancel_event,
+                  engine: Engine | None = None, persist_state: bool = True) -> None:
+    """Revisão contextual dos trechos duvidosos. Uma falha aqui nunca derruba a transcrição: vira aviso."""
+    from app.pipeline import refine
+    from app.pipeline.models import ensure_model
+
+    if persist_state:
+        j.update_fields(job_id, state="REFINING")
+    emit("state", "REFINING")
+    t0 = time.monotonic()
+    own = engine is None
+    try:
+        if engine is None:
+            def _dlp(done, total):
+                emit("download_progress", {"done": done, "total": total})
+
+            model_path = ensure_model(cfg["model_size"], models_dir, on_progress=_dlp, cancel_event=cancel_event)
+            engine = Engine(model_path, cfg["model_size"], cfg, prefer_gpu=(cfg.get("device") == "cuda"), emit=emit)
+            emit("state", "REFINING")
+        language = cfg.get("language") or j.job(job_id)["detected_language"]
+        task = cfg.get("task", "transcribe")
+
+        def decode(audio, prompt, hotwords):
+            while True:
+                try:
+                    return _refine_decode(engine, audio, language, task, prompt, hotwords)
+                except (RuntimeError, MemoryError, OSError, ValueError) as e:
+                    msg = str(e)
+                    if isinstance(e, MemoryError) or OOM_PATTERNS.search(msg):
+                        if engine.degrade(f"memória insuficiente na revisão ({msg[:120]})"):
+                            continue
+                    elif engine.step[0] == "cuda" and GPU_RUNTIME_PATTERNS.search(msg):
+                        if engine.degrade_to_cpu(f"falha do runtime da GPU ({msg[:160]})"):
+                            continue
+                    raise
+
+        last = [0.0]
+
+        def _p(frac):
+            now = time.monotonic()
+            if now - last[0] >= PROGRESS_INTERVAL_S or frac >= 1.0:
+                last[0] = now
+                emit("refine_progress", frac)
+
+        n = refine.refine_job(j, job_id, wav_path, decode, language, on_progress=_p, cancel_event=cancel_event)
+        emit("log", f"Revisão contextual: {n} sugestão(ões) ({time.monotonic() - t0:.1f}s).")
+        emit("suggestions", {"count": n})
+    except (Cancelled, InterruptedError):
+        raise
+    except Exception as e:
+        log.exception("Falha na revisão contextual")
+        msg = f"Não foi possível revisar os trechos duvidosos: {e}"
+        j.add_warning(job_id, msg)
+        emit("warning", msg)
+    finally:
+        if own and engine is not None:
+            engine.close()
 
 
 def _diarize_stage(j: Journal, job_id: str, wav_path: str, cfg: dict, models_dir: Path, emit, cancel_event,

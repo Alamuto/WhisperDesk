@@ -87,13 +87,15 @@ def test_schema_v1_migrates(tmp_path):
     # Simula um banco da v2.0 (sem as colunas novas).
     c = sqlite3.connect(db)
     for sql in ("ALTER TABLE segment DROP COLUMN orig_text", "ALTER TABLE segment DROP COLUMN orig_words",
-                "ALTER TABLE job DROP COLUMN diarized", "PRAGMA user_version=1"):
+                "ALTER TABLE job DROP COLUMN diarized", "ALTER TABLE job DROP COLUMN refined",
+                "DROP TABLE suggestion", "PRAGMA user_version=1"):
         c.execute(sql)
     c.commit()
     c.close()
     j = Journal(db)
-    assert j.conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert j.conn.execute("PRAGMA user_version").fetchone()[0] == 3
     assert j.job(jid)["diarized"] == 0
+    assert j.job(jid)["refined"] == 0
     assert j.segments_with_words(jid)[0]["text"] == "olá mundo"
     j.close()
 

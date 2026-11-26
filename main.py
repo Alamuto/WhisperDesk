@@ -37,6 +37,7 @@ def _setup_logging():
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     import platform
 
+
     from app import __version__
 
     logging.getLogger("whisperdesk").info(
@@ -94,7 +95,6 @@ def _emit_report(report: dict, out: str | None) -> None:
 
 def selftest(argv: list[str]) -> int:
     import platform
-    import subprocess
 
     from app import paths, runtime
 
@@ -105,13 +105,9 @@ def selftest(argv: list[str]) -> int:
     try:
         from app.pipeline import ffmpeg_tools
 
-        for name in ("ffmpeg", "ffprobe"):
-            exe = ffmpeg_tools.tool(name)
-            out = subprocess.run([exe, "-hide_banner", "-version"], capture_output=True, text=True, timeout=20,
-                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            report[name] = {"path": exe, "version": (out.stdout.splitlines() or ["?"])[0]}
+        report["media"] = ffmpeg_tools.backend_version()
     except Exception as e:  # noqa: BLE001
-        report["ffmpeg_error"] = repr(e)
+        report["media_error"] = repr(e)
         ok = False
     try:
         import ctranslate2
@@ -147,16 +143,23 @@ def selftest(argv: list[str]) -> int:
         # cuBLAS/cuDNN são carregados sob demanda pelo CTranslate2: verificar que estão resolvíveis.
         import ctypes
 
+        from app import gpu_pack
+
         libs = {}
-        # Só estas são carregadas pelo CTranslate2 no Whisper (medido); as sub-libs do cuDNN não são empacotadas.
-        for dll in ("cublas64_12.dll", "cublasLt64_12.dll", "cudnn64_9.dll"):
+        # Só estas são carregadas pelo CTranslate2 no Whisper (medido).
+        names = {"nt": ("cublas64_12.dll", "cublasLt64_12.dll", "cudnn64_9.dll")}.get(
+            os.name, ("libcublas.so.12", "libcublasLt.so.12", "libcudnn.so.9"))
+        loader = ctypes.WinDLL if os.name == "nt" else ctypes.CDLL
+        for dll in names:
             try:
-                ctypes.WinDLL(dll)
+                loader(dll)
                 libs[dll] = "ok"
             except OSError as e:
                 libs[dll] = f"FALHOU: {e}"
         report["cuda_libs"] = libs
-        report["cuda_runtime"] = "ok" if all(v == "ok" for v in libs.values()) else "incompleto"
+        report["gpu_pack"] = {"installed": gpu_pack.is_installed(), "dir": str(gpu_pack.pack_dir()),
+                              "download_mb": gpu_pack.download_size_mb()}
+        report["cuda_runtime"] = "ok" if all(v == "ok" for v in libs.values()) else "pacote GPU não instalado"
     report["ok"] = ok
     _emit_report(report, _arg_value(argv, "--out"))
     return 0 if ok else 1
@@ -281,13 +284,15 @@ def run_gui(argv: list[str]) -> int:
     from app.utils.i18n import init_i18n
 
     init_i18n()
-    font = QFont("Segoe UI", 10)
+    from app.utils.desktop import IS_MAC, ui_font_family
+
+    font = QFont(ui_font_family(), 13 if IS_MAC else 10)
     font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
     app.setFont(font)
 
     from app import paths
 
-    icon = paths.resource_dir() / "assets" / "icon.ico"
+    icon = paths.resource_dir() / "assets" / ("icon.ico" if os.name == "nt" else "icon.png")
     if icon.is_file():
         app.setWindowIcon(QIcon(str(icon)))
 
@@ -314,6 +319,19 @@ def run_gui(argv: list[str]) -> int:
             window.open_external_file("")
 
     server.newConnection.connect(_on_new_connection)
+
+    # macOS entrega "Abrir com" / arrastar no ícone do Dock como QFileOpenEvent, não como argumento.
+    from PySide6.QtCore import QEvent, QObject
+
+    class _FileOpenFilter(QObject):
+        def eventFilter(self, obj, ev):  # noqa: N802 — API do Qt
+            if ev.type() == QEvent.Type.FileOpen and ev.file():
+                window.open_external_file(ev.file())
+                return True
+            return False
+
+    file_open_filter = _FileOpenFilter(app)
+    app.installEventFilter(file_open_filter)
     window.show()
     if file_arg:
         window.open_external_file(os.path.abspath(file_arg))

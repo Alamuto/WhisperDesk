@@ -19,7 +19,7 @@ from typing import Iterator
 
 from app.pipeline import ENGINE_VERSION
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_CHUNK_ATTEMPTS = 3
 
 SCHEMA = """
@@ -95,6 +95,21 @@ CREATE TABLE IF NOT EXISTS word (
     FOREIGN KEY (job_id, chunk_idx, seg_seq)
         REFERENCES segment(job_id, chunk_idx, seq) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS suggestion (
+    job_id     TEXT NOT NULL,
+    chunk_idx  INTEGER NOT NULL,
+    seq        INTEGER NOT NULL,
+    text       TEXT NOT NULL,
+    words      TEXT NOT NULL,
+    old_score  REAL,
+    new_score  REAL,
+    status     TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted','rejected')),
+    created_at REAL NOT NULL,
+    PRIMARY KEY (job_id, chunk_idx, seq),
+    FOREIGN KEY (job_id, chunk_idx, seq)
+        REFERENCES segment(job_id, chunk_idx, seq) ON DELETE CASCADE
+);
 """
 
 # v2: edição manual de trechos (texto original preservado) e marca de diarização no job.
@@ -104,6 +119,10 @@ MIGRATIONS = {
         "ALTER TABLE segment ADD COLUMN orig_words TEXT",
         "ALTER TABLE job ADD COLUMN diarized INTEGER NOT NULL DEFAULT 0",
     ),
+    # v3: revisão contextual (a tabela `suggestion` vem do SCHEMA, criado com IF NOT EXISTS).
+    3: (
+        "ALTER TABLE job ADD COLUMN refined INTEGER NOT NULL DEFAULT 0",
+    ),
 }
 
 RELEVANT_CONFIG_KEYS = (
@@ -111,7 +130,7 @@ RELEVANT_CONFIG_KEYS = (
 )
 
 # Estados terminais / retomáveis
-ACTIVE_STATES = ("CREATED", "EXTRACTING", "PLANNING", "TRANSCRIBING", "POSTPROCESSING", "DIARIZING", "PAUSED")
+ACTIVE_STATES = ("CREATED", "EXTRACTING", "PLANNING", "TRANSCRIBING", "POSTPROCESSING", "REFINING", "DIARIZING", "PAUSED")
 TERMINAL_STATES = ("DONE", "FAILED")
 
 
@@ -154,6 +173,8 @@ def pid_alive(pid: int | None) -> bool:
     try:
         os.kill(int(pid), 0)
         return True
+    except PermissionError:
+        return True  # existe, mas pertence a outro usuário
     except OSError:
         return False
 
@@ -291,7 +312,7 @@ class Journal:
             c.execute("DELETE FROM word WHERE job_id=?", (job_id,))
             c.execute("DELETE FROM segment WHERE job_id=?", (job_id,))
             c.execute("DELETE FROM chunk WHERE job_id=?", (job_id,))
-            c.execute("UPDATE job SET state='CREATED', error=NULL, warnings=NULL, finished_at=NULL, "
+            c.execute("UPDATE job SET state='CREATED', error=NULL, warnings=NULL, finished_at=NULL, refined=0, "
                       "updated_at=? WHERE id=?", (time.time(), job_id))
 
     # ---------- chunks ----------
@@ -426,8 +447,53 @@ class Journal:
             out.append({"start_ms": r[2], "end_ms": r[3], "text": r[4], "avg_logprob": r[5],
                         "speaker": r[6], "words": words.get((r[0], r[1]), []),
                         "key": (r[0], r[1]), "edited": r[7] is not None})
+        sugg = self.suggestions(job_id)
+        if sugg:
+            for s in out:
+                hit = sugg.get(s["key"])
+                if hit is not None:
+                    s["suggestion"] = hit
         out.sort(key=lambda s: s["start_ms"])
         return out
+
+    # ---------- revisão contextual ----------
+    def suggestions(self, job_id) -> dict[tuple[int, int], dict]:
+        """Sugestões pendentes por trecho: {key: {"text", "words"}}."""
+        return {(r[0], r[1]): {"text": r[2], "words": [tuple(w) for w in json.loads(r[3])]}
+                for r in self.conn.execute(
+                    "SELECT chunk_idx, seq, text, words FROM suggestion WHERE job_id=? AND status='pending'",
+                    (job_id,))}
+
+    def resolved_suggestion_keys(self, job_id) -> set[tuple[int, int]]:
+        return {(r[0], r[1]) for r in self.conn.execute(
+            "SELECT chunk_idx, seq FROM suggestion WHERE job_id=? AND status!='pending'", (job_id,))}
+
+    def clear_pending_suggestions(self, job_id) -> None:
+        self.conn.execute("DELETE FROM suggestion WHERE job_id=? AND status='pending'", (job_id,))
+
+    def add_suggestions(self, job_id, items: list[tuple]) -> None:
+        """items: [(key, texto, palavras, score_antigo, score_novo)]."""
+        now = time.time()
+        with self.tx() as c:
+            c.executemany(
+                "INSERT OR REPLACE INTO suggestion(job_id, chunk_idx, seq, text, words, old_score, new_score, "
+                "status, created_at) VALUES (?,?,?,?,?,?,?,'pending',?)",
+                [(job_id, k[0], k[1], text, json.dumps([list(w) for w in words], ensure_ascii=False),
+                  float(old), float(new), now) for k, text, words, old, new in items])
+
+    def resolve_suggestion(self, job_id, key: tuple[int, int], accept: bool) -> bool:
+        """Aceita (aplica como edição, com o original restaurável) ou recusa uma sugestão pendente."""
+        ci, sq = key
+        row = self.conn.execute("SELECT text, words FROM suggestion WHERE job_id=? AND chunk_idx=? AND seq=? "
+                                "AND status='pending'", (job_id, ci, sq)).fetchone()
+        if row is None:
+            return False
+        if accept:
+            self.edit_segment(job_id, key, row["text"], [tuple(w) for w in json.loads(row["words"])],
+                              keep_suggestion=True)
+        self.conn.execute("UPDATE suggestion SET status=? WHERE job_id=? AND chunk_idx=? AND seq=?",
+                          ("accepted" if accept else "rejected", job_id, ci, sq))
+        return True
 
     # ---------- edição e falantes ----------
     def segment_keys(self, job_id) -> list[dict]:
@@ -464,10 +530,14 @@ class Journal:
         self.conn.execute("UPDATE segment SET speaker=? WHERE job_id=? AND chunk_idx=? AND seq=?",
                           (speaker, job_id, key[0], key[1]))
 
-    def edit_segment(self, job_id, key: tuple[int, int], text: str, words: list[tuple]) -> None:
+    def edit_segment(self, job_id, key: tuple[int, int], text: str, words: list[tuple],
+                     keep_suggestion: bool = False) -> None:
         """Substitui o texto (e as palavras realinhadas) de um trecho, preservando o original na 1ª edição."""
         ci, sq = key
         with self.tx() as c:
+            if not keep_suggestion:  # editado à mão: a sugestão pendente perdeu o sentido
+                c.execute("UPDATE suggestion SET status='rejected' WHERE job_id=? AND chunk_idx=? AND seq=? "
+                          "AND status='pending'", (job_id, ci, sq))
             row = c.execute("SELECT text, orig_text FROM segment WHERE job_id=? AND chunk_idx=? AND seq=?",
                             (job_id, ci, sq)).fetchone()
             if row is None:

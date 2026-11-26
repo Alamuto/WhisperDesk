@@ -29,13 +29,52 @@ def seg(words, **kw):
 
 def ffmpeg_available() -> bool:
     try:
-        from app.pipeline import ffmpeg_tools
+        import av  # noqa: F401
 
-        ffmpeg_tools.tool("ffmpeg")
-        ffmpeg_tools.tool("ffprobe")
         return True
     except Exception:
         return False
+
+
+def make_media(path, seconds: int = 12, two_tracks: bool = False):
+    """Gera mídia de teste com PyAV: senoide 440 Hz (e uma 2ª trilha estéreo 880 Hz, idioma 'eng')."""
+    import av
+    import numpy as np
+
+    path = str(path)
+    aac = path.endswith((".mkv", ".m4a"))
+    specs = [(440, 44100, "mono", None)]
+    if two_tracks:
+        specs.append((880, 48000, "stereo", "eng"))
+    with av.open(path, "w") as out:
+        streams = []
+        for freq, sr, layout, lang in specs:
+            s = out.add_stream("aac" if aac else "pcm_s16le", rate=sr, layout=layout)
+            if lang:
+                s.metadata["language"] = lang
+            streams.append((s, freq, sr, layout))
+        for s, freq, sr, layout in streams:
+            fmt = "fltp" if aac else "s16"
+            ch = 1 if layout == "mono" else 2
+            n = 1024
+            total = int(seconds * sr)
+            for start in range(0, total, n):
+                t = (np.arange(start, min(total, start + n)) / sr).astype(np.float64)
+                x = 0.5 * np.sin(2 * np.pi * freq * t)
+                if aac:
+                    arr = np.tile(x.astype(np.float32), (ch, 1))
+                else:
+                    arr = np.repeat((x * 32767).astype(np.int16), ch).reshape(1, -1)
+                f = av.AudioFrame.from_ndarray(arr, format=fmt, layout=layout)
+                f.sample_rate = sr
+                f.pts = start
+                for pkt in s.encode(f):
+                    out.mux(pkt)
+            for pkt in s.encode(None):
+                out.mux(pkt)
+    from pathlib import Path
+
+    return Path(path)
 
 
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")

@@ -1,29 +1,30 @@
 # -*- mode: python ; coding: utf-8 -*-
-# Build: tools\prepare_build.py (preenche build_cache\) e depois `pyinstaller WhisperDesk.spec --noconfirm`.
-# onedir sem UPX: inicialização rápida, DLLs CUDA intactas e menos falsos positivos de antivírus.
+# Build: `pyinstaller WhisperDesk.spec --noconfirm` (Windows, Linux e macOS).
+# onedir sem UPX: inicialização rápida e menos falsos positivos de antivírus.
+#
+# O que NÃO vai no pacote (v2.2):
+#   - ffmpeg/ffprobe: a mídia é decodificada pelo PyAV (bibliotecas do FFmpeg já na wheel `av`);
+#   - cuBLAS/cuDNN: baixados sob demanda pelo app só em máquinas com GPU NVIDIA (app/gpu_pack.py);
+#   - partes do Qt que um app de widgets não usa (Quick/QML, teclado virtual, OpenGL por software, traduções).
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
 ROOT = Path(SPECPATH)
-CACHE = ROOT / "build_cache"
-for need in (CACHE / "bin" / "ffmpeg.exe", CACHE / "bin" / "ffprobe.exe", CACHE / "cuda" / "cublas64_12.dll"):
-    if not need.is_file():
-        sys.exit(f"Falta {need}. Rode: python tools\\prepare_build.py")
+IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+sys.path.insert(0, str(ROOT))
+from app import __version__ as VERSION  # noqa: E402
 
 binaries = collect_dynamic_libs("ctranslate2") + collect_dynamic_libs("onnxruntime")
-binaries += [(str(p), "bin") for p in (CACHE / "bin").glob("*.exe")]
-binaries += [(str(p), "cuda") for p in (CACHE / "cuda").glob("*.dll")]
-
 datas = collect_data_files("faster_whisper")          # silero_vad_v6.onnx
-datas += [(str(p), "bin") for p in (CACHE / "bin").glob("*.txt")]
-datas += [(str(ROOT / "assets" / "icon.ico"), "assets"), (str(ROOT / "assets" / "icon.png"), "assets")]
+datas += [(str(ROOT / "assets" / n), "assets") for n in ("icon.ico", "icon.png", "icon.icns")]
 datas += [(str(ROOT / "packaging" / "THIRD_PARTY_NOTICES.txt"), ".")]
 
 excludes = [
     "torch", "torchaudio", "torchvision", "tensorflow", "matplotlib", "pandas", "scipy", "IPython", "jupyter",
-    "tkinter", "_tkinter", "pydub", "ffmpeg", "hf_xet", "pytest", "PyInstaller",
+    "tkinter", "_tkinter", "pydub", "ffmpeg", "hf_xet", "pytest", "PyInstaller", "PIL",
     "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.QtWebEngineQuick", "PySide6.QtWebChannel",
     "PySide6.QtQml", "PySide6.QtQuick", "PySide6.QtQuickWidgets", "PySide6.Qt3DCore", "PySide6.QtCharts",
     "PySide6.QtDataVisualization", "PySide6.QtPdf", "PySide6.QtPdfWidgets", "PySide6.QtSql", "PySide6.QtTest",
@@ -37,7 +38,8 @@ a = Analysis(
     pathex=[str(ROOT)],
     binaries=binaries,
     datas=datas,
-    hiddenimports=["app.pipeline.worker", "app.pipeline.live_worker", "app.pipeline.diarize", "pynvml", "PySide6.QtMultimedia", "PySide6.QtNetwork"],
+    hiddenimports=["app.pipeline.worker", "app.pipeline.live_worker", "app.pipeline.diarize", "pynvml",
+                   "PySide6.QtMultimedia", "PySide6.QtNetwork", *collect_submodules("av")],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -45,10 +47,36 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
-# A análise de dependências também puxa cuBLAS/cuDNN do venv para a raiz de _internal; a cópia válida é a de cuda\.
-_CUDA_NAMES = {p.name.lower() for p in (CACHE / "cuda").glob("*.dll")}
-a.binaries = [b for b in a.binaries
-              if not (Path(b[0]).name.lower() in _CUDA_NAMES and Path(b[0]).parent.as_posix() != "cuda")]
+
+# ---- poda do que não é usado (os nomes variam entre .dll, .so e .framework)
+_DROP_PARTS = (
+    "cublas", "cudnn", "nvrtc", "cudart", "nvblas",           # CUDA: pacote GPU sob demanda
+    "opengl32sw",                                            # OpenGL por software (só para Qt Quick)
+    "qt6quick", "qt6qml", "qtquick", "qtqml",                # Qt Quick/QML
+    "qt6virtualkeyboard", "qtvirtualkeyboard",               # teclado virtual (e seu plugin)
+    "qtuiotouchplugin",
+    "qtiff", "qwebp", "qtga", "qwbmp",                       # formatos de imagem não usados
+)
+_DROP_DIRS = ("translations",)                               # o app tem i18n próprio; QTranslator não é usado
+if not IS_MAC:
+    _DROP_PARTS += ("qicns",)
+
+
+def _keep(entry) -> bool:
+    dest = entry[0].replace("\\", "/").lower()
+    name = dest.rsplit("/", 1)[-1]
+    if any(f"/{d}/" in f"/{dest}" for d in _DROP_DIRS) and "pyside6" in dest:
+        return False
+    if any(p in name for p in _DROP_PARTS):
+        return name == "cudnn64_9.dll" and "ctranslate2" in dest  # stub de 260 kB da própria wheel do CT2
+    return True
+
+
+before = len(a.binaries) + len(a.datas)
+a.binaries = [b for b in a.binaries if _keep(b)]
+a.datas = [d for d in a.datas if _keep(d)]
+print(f"[WhisperDesk.spec] podados {before - len(a.binaries) - len(a.datas)} arquivos")
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
@@ -67,9 +95,9 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=str(ROOT / "assets" / "icon.ico"),
-    version=str(ROOT / "packaging" / "version_info.py"),
-    manifest=str(ROOT / "packaging" / "WhisperDesk.manifest"),
+    icon=str(ROOT / "assets" / ("icon.ico" if IS_WIN else "icon.icns")) if (IS_WIN or IS_MAC) else None,
+    version=str(ROOT / "packaging" / "version_info.py") if IS_WIN else None,
+    manifest=str(ROOT / "packaging" / "WhisperDesk.manifest") if IS_WIN else None,
 )
 coll = COLLECT(
     exe,
@@ -80,3 +108,29 @@ coll = COLLECT(
     upx_exclude=[],
     name="WhisperDesk",
 )
+
+if IS_MAC:
+    app = BUNDLE(
+        coll,
+        name="WhisperDesk.app",
+        icon=str(ROOT / "assets" / "icon.icns"),
+        bundle_identifier="io.github.alamuto.whisperdesk",
+        version=VERSION,
+        info_plist={
+            "CFBundleName": "WhisperDesk",
+            "CFBundleDisplayName": "WhisperDesk",
+            "CFBundleShortVersionString": VERSION,
+            "CFBundleVersion": VERSION,
+            "NSHighResolutionCapable": True,
+            "NSRequiresAquaSystemAppearance": False,
+            "LSMinimumSystemVersion": "12.0",
+            "NSMicrophoneUsageDescription": "WhisperDesk usa o microfone para transcrever gravações ao vivo, "
+                                            "no próprio computador.",
+            "CFBundleDocumentTypes": [{
+                "CFBundleTypeName": "Audio/Video",
+                "CFBundleTypeRole": "Viewer",
+                "LSHandlerRank": "Alternate",
+                "LSItemContentTypes": ["public.audio", "public.movie"],
+            }],
+        },
+    )

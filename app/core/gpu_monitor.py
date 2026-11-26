@@ -8,6 +8,7 @@ _lock = threading.Lock()
 _nvml_state: bool | None = None  # None = não tentado
 _handle = None
 _cuda_ok: bool | None = None
+_gpu_ok: bool | None = None
 
 
 @dataclass
@@ -60,20 +61,53 @@ def _nvml():
         return pynvml, _handle
 
 
-def is_cuda_available() -> bool:
-    """True se o CTranslate2 enxerga ao menos uma GPU CUDA (driver presente)."""
-    global _cuda_ok
-    if _cuda_ok is None:
+def has_nvidia_gpu() -> bool:
+    """True se há GPU CUDA com driver (mesmo que as bibliotecas cuBLAS/cuDNN ainda não estejam instaladas)."""
+    global _gpu_ok
+    if _gpu_ok is None:
         try:
             from app import runtime
 
             runtime.prepare()
             import ctranslate2
 
-            _cuda_ok = ctranslate2.get_cuda_device_count() > 0
+            _gpu_ok = ctranslate2.get_cuda_device_count() > 0
+        except Exception:
+            _gpu_ok = False
+        if not _gpu_ok:
+            nv, _h = _nvml()
+            _gpu_ok = nv is not None
+    return _gpu_ok
+
+
+def is_cuda_available() -> bool:
+    """True se dá para transcrever em CUDA agora: GPU com driver e bibliotecas CUDA resolvíveis."""
+    global _cuda_ok
+    if _cuda_ok is None:
+        try:
+            from app import runtime
+
+            _cuda_ok = has_nvidia_gpu() and runtime.cuda_libs_ready()
         except Exception:
             _cuda_ok = False
     return _cuda_ok
+
+
+def gpu_pack_needed() -> bool:
+    """GPU NVIDIA presente, mas sem as bibliotecas CUDA: o pacote GPU pode ser baixado."""
+    from app import gpu_pack
+
+    return gpu_pack.platform_key() is not None and has_nvidia_gpu() and not is_cuda_available()
+
+
+def refresh_cuda() -> bool:
+    """Reavalia depois de instalar o pacote GPU."""
+    global _cuda_ok
+    from app import runtime
+
+    runtime.activate_cuda_dirs()
+    _cuda_ok = None
+    return is_cuda_available()
 
 
 def get_gpu_name() -> str:

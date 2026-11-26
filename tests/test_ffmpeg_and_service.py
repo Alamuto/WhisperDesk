@@ -1,5 +1,4 @@
-"""Testes de integração com ffmpeg real (probe, extração, picos) e da camada de serviço."""
-import subprocess
+"""Testes de integração de mídia (PyAV: probe, extração, picos) e da camada de serviço."""
 import threading
 from pathlib import Path
 
@@ -8,20 +7,13 @@ import soundfile as sf
 
 from tests.conftest import ffmpeg_available
 
-pytestmark = pytest.mark.skipif(not ffmpeg_available(), reason="ffmpeg/ffprobe indisponíveis")
+pytestmark = pytest.mark.skipif(not ffmpeg_available(), reason="PyAV indisponível")
 
 
 def _make_media(path: Path, seconds: int = 12, two_tracks: bool = False):
-    from app.pipeline import ffmpeg_tools
+    from tests.conftest import make_media
 
-    cmd = [ffmpeg_tools.tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y",
-           "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=44100:duration={seconds}"]
-    if two_tracks:
-        cmd += ["-f", "lavfi", "-i", f"sine=frequency=880:sample_rate=48000:duration={seconds}",
-                "-map", "0:a", "-map", "1:a", "-ac:a:1", "2", "-metadata:s:a:1", "language=eng"]
-    cmd += ["-c:a", "aac" if path.suffix in (".mkv", ".m4a") else "pcm_s16le", str(path)]
-    subprocess.run(cmd, check=True, capture_output=True)
-    return path
+    return make_media(path, seconds, two_tracks)
 
 
 def test_probe_reports_streams(tmp_path):

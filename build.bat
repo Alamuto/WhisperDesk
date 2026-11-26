@@ -1,16 +1,16 @@
 @echo off
-REM Build de distribuicao: testes -> binarios nativos -> PyInstaller -> selftest -> instalador (se Inno Setup existir).
-REM Uso: build.bat [--skip-tests] [--ffmpeg-dir C:\caminho\ffmpeg\bin]
+REM Build de distribuicao (Windows): testes -> PyInstaller -> selftest -> instalador (se Inno Setup existir).
+REM Uso: build.bat [--skip-tests]
+REM v2.2: sem ffmpeg.exe nem DLLs CUDA no pacote. A midia e lida pelo PyAV e a GPU e ativada por um
+REM download sob demanda feito pelo proprio app (so em maquinas com placa NVIDIA).
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 set "PY=.venv\Scripts\python.exe"
 set "SKIPTESTS="
-set "FFARG="
 
 :args
 if "%~1"=="" goto args_done
 if /i "%~1"=="--skip-tests" set "SKIPTESTS=1"
-if /i "%~1"=="--ffmpeg-dir" (set "FFARG=--ffmpeg-dir "%~2"" & shift)
 shift
 goto args
 
@@ -21,17 +21,14 @@ if not exist "%PY%" (
 )
 
 if not defined SKIPTESTS (
-    echo === [1/5] Testes ===
+    echo === [1/4] Testes ===
     "%PY%" -m pytest -q tests || (echo [ERRO] Testes falharam. & exit /b 1)
 )
 
-echo === [2/5] Binarios nativos (ffmpeg, cuBLAS) ===
-"%PY%" tools\prepare_build.py !FFARG! || exit /b 1
-
-echo === [3/5] Icone ===
+echo === [2/4] Icone ===
 if not exist "assets\icon.ico" ("%PY%" tools\make_icon.py || exit /b 1)
 
-echo === [4/5] PyInstaller ===
+echo === [3/4] PyInstaller ===
 if exist "dist\WhisperDesk" rmdir /s /q "dist\WhisperDesk"
 "%PY%" -m PyInstaller --noconfirm --clean WhisperDesk.spec || (echo [ERRO] PyInstaller falhou. & exit /b 1)
 
@@ -43,7 +40,7 @@ if errorlevel 1 (
 )
 type "build\selftest.json"
 
-echo === [5/5] Instalador ===
+echo === [4/4] Instalador ===
 set "ISCC="
 for %%P in ("%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" "%ProgramFiles%\Inno Setup 6\ISCC.exe" "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe") do (
     if exist %%P set "ISCC=%%~P"

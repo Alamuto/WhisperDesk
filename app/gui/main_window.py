@@ -22,7 +22,8 @@ from PySide6.QtWidgets import (
 
 from app import __version__, paths
 from app.core.audio_player import AudioPlayer
-from app.core.gpu_monitor import get_gpu_name, is_cuda_available, shutdown as gpu_shutdown
+from app.core.gpu_monitor import get_gpu_name, gpu_pack_needed, is_cuda_available, shutdown as gpu_shutdown
+from app.gui.gpu_pack_ui import GpuPackManager
 from app.gui import icons, theme
 from app.gui.config_panel import ConfigPanel
 from app.gui.dropzone import WAVEFORM_BINS, DropZone, is_supported
@@ -50,6 +51,7 @@ _STAGES = {
     "PLANNING": ("stage_planning", False),
     "LOADING_MODEL": ("stage_loading_model", True),
     "TRANSCRIBING": ("stage_transcribing", False),
+    "REFINING": ("stage_refining", False),
     "DIARIZING": ("stage_diarizing", False),
 }
 
@@ -393,10 +395,14 @@ class MainWindow(QMainWindow):
         self._status_label = QLabel(tr("ready"))
         self._status_label.setObjectName("faint")
         lay.addWidget(self._status_label, 1)
-        cuda = is_cuda_available()
-        self._gpu_chip = QLabel(get_gpu_name() if cuda else tr("cpu_mode_short"))
+        self._gpu_chip = QLabel()
         self._gpu_chip.setObjectName("chip")
-        self._gpu_chip.setToolTip(tr("gpu_cpu_mode") if not cuda else "CUDA")
+        self._gpu_chip.mousePressEvent = lambda _e: self._on_gpu_chip_clicked()
+        self._gpu_pack = GpuPackManager(self)
+        self._gpu_pack.progress.connect(self._on_gpu_pack_progress)
+        self._gpu_pack.ready.connect(self._on_gpu_pack_ready)
+        self._gpu_pack.failed.connect(self._on_gpu_pack_failed)
+        self._update_gpu_chip()
         lay.addWidget(self._gpu_chip, 0, Qt.AlignmentFlag.AlignVCenter)
         self._log_btn = QPushButton(tr("tech_log"))
         self._log_btn.setObjectName("ghost")
@@ -426,6 +432,7 @@ class MainWindow(QMainWindow):
         self._queue.add_button.clicked.connect(lambda: self._dropzone.choose_files(allow_busy=True))
         self._live.level.connect(self._live_panel.set_level)
         self._result_view.diarize_requested.connect(self._on_diarize_requested)
+        self._result_view.refine_requested.connect(self._on_refine_requested)
         self._config_panel.start_clicked.connect(self._on_start_transcription)
         self._progress_area.cancel_requested.connect(self._on_cancel)
         self._history_panel.entry_selected.connect(self._on_history_entry_selected)
@@ -588,9 +595,8 @@ class MainWindow(QMainWindow):
         self._sec_settings.setText(tr("section_settings").upper())
         self._hero.title.setText(tr("drop_title"))
         self._hero.subtitle.setText(tr("drop_subtitle"))
-        if not is_cuda_available():
-            self._gpu_chip.setText(tr("cpu_mode_short"))
-            self._gpu_chip.setToolTip(tr("gpu_cpu_mode"))
+        if not self._gpu_pack.is_running():
+            self._update_gpu_chip()
         self._mic_btn.setText(tr("record_mic"))
         self._mic_btn.setToolTip(f"{tr('record_mic_tip')}  (Ctrl+R)")
         self._hero_mic.setText(tr("record_mic"))
@@ -603,9 +609,74 @@ class MainWindow(QMainWindow):
             self._status_label.setText(tr("ready"))
 
     def _open_data_folder(self):
-        p = str(paths.local_dir())
-        if os.name == "nt":
-            os.startfile(p)  # noqa: S606 — pasta local do próprio app
+        from app.utils.desktop import open_folder
+
+        open_folder(paths.local_dir())
+
+    # ================================================================ pacote GPU (sob demanda)
+    def _update_gpu_chip(self):
+        chip = self._gpu_chip
+        if is_cuda_available():
+            chip.setText(get_gpu_name())
+            chip.setToolTip("CUDA")
+            chip.setCursor(Qt.CursorShape.ArrowCursor)
+        elif gpu_pack_needed():
+            chip.setText(f"{tr('cpu_mode_short')} · {tr('gpu_pack_download')}")
+            chip.setToolTip(tr("gpu_pack_tip"))
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            chip.setText(tr("cpu_mode_short"))
+            chip.setToolTip(tr("gpu_cpu_mode"))
+            chip.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def _on_gpu_chip_clicked(self):
+        if not self._gpu_pack.is_running() and gpu_pack_needed():
+            self._offer_gpu_pack(asked=True)
+
+    def _maybe_offer_gpu_pack(self):
+        try:
+            needed = gpu_pack_needed()
+        except Exception:  # noqa: BLE001
+            log.exception("Falha ao verificar o pacote GPU")
+            return
+        if needed and not app_config.get("gpu_pack_declined", False):
+            self._offer_gpu_pack(asked=False)
+
+    def _offer_gpu_pack(self, asked: bool):
+        from app import gpu_pack
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(tr("gpu_pack"))
+        box.setText(tr("gpu_pack_offer", size=gpu_pack.download_size_mb()))
+        box.setInformativeText(tr("gpu_pack_tip"))
+        go = box.addButton(tr("gpu_pack_download"), QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(tr("gpu_pack_later"), QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(go)
+        box.exec()
+        if box.clickedButton() is go:
+            app_config.set_value("gpu_pack_declined", False)
+            self._gpu_chip.setCursor(Qt.CursorShape.BusyCursor)
+            self._on_gpu_pack_progress(0, gpu_pack.download_size_mb())
+            self._gpu_pack.start()
+        elif not asked:
+            app_config.set_value("gpu_pack_declined", True)  # não insiste; o chip do rodapé continua oferecendo
+
+    def _on_gpu_pack_progress(self, done_mb: int, total_mb: int):
+        text = tr("gpu_pack_downloading", done=done_mb, total=total_mb)
+        self._gpu_chip.setText(text)
+        self._gpu_chip.setToolTip(tr("gpu_pack_tip"))
+
+    def _on_gpu_pack_ready(self):
+        self._update_gpu_chip()
+        self._config_panel.set_cuda_available(True)
+        self.show_toast(tr("gpu_pack_ready"), kind="success", duration_ms=6000)
+        self._log_panel.append(tr("gpu_pack_ready"))
+
+    def _on_gpu_pack_failed(self, error: str):
+        self._update_gpu_chip()
+        if error and not self._quitting:
+            self.show_toast(tr("gpu_pack_failed", error=error), kind="error", duration_ms=8000)
 
     # ================================================================ arrastar e soltar
     @staticmethod
@@ -682,6 +753,7 @@ class MainWindow(QMainWindow):
                 self._history_panel.refresh()
         except Exception:
             log.exception("Falha ao importar histórico antigo")
+        QTimer.singleShot(1500, self._maybe_offer_gpu_pack)
         try:
             jobs = service.resumable_jobs()
         except Exception:
@@ -824,8 +896,9 @@ class MainWindow(QMainWindow):
                 return
             QMessageBox.critical(self, tr("file_error"), str(e))
             return
-        if state == "DONE" and cfg.get("diarize") and not service.is_diarized(jid):
-            # Já transcrito, só falta identificar os falantes: o worker faz só essa etapa.
+        if state == "DONE" and ((cfg.get("diarize") and not service.is_diarized(jid))
+                                or (cfg.get("refine") and not service.is_refined(jid))):
+            # Já transcrito, faltam só etapas posteriores (revisão, falantes): o worker faz só elas.
             self._start_job(jid, resumed=True)
             return
         if state == "DONE" and self._queue_active:
@@ -932,8 +1005,11 @@ class MainWindow(QMainWindow):
                 self._status_label.setText(tr(key))
             if payload == "TRANSCRIBING" and self._job_id:
                 pa.begin_transcription(service.job_progress(self._job_id))
-        elif kind in ("extract_progress", "plan_progress", "diarize_progress"):
+        elif kind in ("extract_progress", "plan_progress", "diarize_progress", "refine_progress"):
             pa.set_stage_fraction(float(payload or 0))
+        elif kind == "suggestions":
+            n = int((payload or {}).get("count") or 0)
+            self._log_panel.append(tr("suggestions_found", count=n) if n else tr("suggestions_none"))
         elif kind == "speakers":
             n = int((payload or {}).get("count") or 0)
             self._log_panel.append(tr("speakers_found", count=n))
@@ -975,7 +1051,8 @@ class MainWindow(QMainWindow):
         if outcome == "done":
             self._progress_area.set_stage(tr("stage_done"))
             self._progress_area.update_progress(1.0)
-            self._show_job(jid)
+            self._show_job(jid, fade_suggestions=True)
+            n_sugg = service.suggestion_count(jid)
             p = payload or {}
             audio_s = float(p.get("audio_s") or 0)
             speed = f" · {audio_s / elapsed:.1f}x" if audio_s and elapsed > 0 else ""
@@ -991,6 +1068,9 @@ class MainWindow(QMainWindow):
             if in_queue:
                 self._queue_stats["done"] += 1
                 self.show_toast(tr("queue_item_done", name=name), kind="success", duration_ms=2600)
+            elif n_sugg:
+                self.show_toast(tr("done_toast_suggestions", elapsed=ProgressArea.format_duration(elapsed),
+                                   count=n_sugg), kind="success", duration_ms=5000)
             else:
                 self.show_toast(tr("done_toast", elapsed=ProgressArea.format_duration(elapsed)), kind="success")
             self._status_label.setText(tr("transcription_complete"))
@@ -1082,6 +1162,23 @@ class MainWindow(QMainWindow):
         cfg = json.loads(row["config_json"] or "{}")
         cfg.update(diarize=True, num_speakers=panel.get("num_speakers") or 0, speaker_label=tr("speaker_n"))
         service.journal().update_fields(jid, config_json=json.dumps(cfg), diarized=0)
+        self._start_job(jid, resumed=True)
+
+    def _on_refine_requested(self, jid: str):
+        """Revisão contextual sob demanda em um resultado pronto (ou refeita)."""
+        if self._is_busy():
+            self.show_toast(tr("busy_cannot_open"), kind="warning")
+            return
+        row = service.job(jid)
+        if row is None:
+            return
+        if not os.path.isfile(row["src_path"] or ""):
+            self.show_toast(tr("refine_need_source"), kind="warning", duration_ms=6000)
+            return
+        cfg = json.loads(row["config_json"] or "{}")
+        cfg["refine"] = True
+        # Revisar não reabre a identificação de falantes.
+        service.journal().update_fields(jid, config_json=json.dumps(cfg), refined=0)
         self._start_job(jid, resumed=True)
 
     # ---------------------------------------------------------------- ao vivo
@@ -1197,7 +1294,7 @@ class MainWindow(QMainWindow):
                  cfg.get("model_size", ""), lang]
         return "  ·  ".join(p for p in parts if p)
 
-    def _show_job(self, jid: str):
+    def _show_job(self, jid: str, fade_suggestions: bool = False):
         row = service.job(jid)
         if row is None:
             return
@@ -1206,7 +1303,8 @@ class MainWindow(QMainWindow):
         exists = bool(src) and os.path.isfile(src)
         same = exists and os.path.normcase(src) == os.path.normcase(self._doc_src)
         self._set_document(src, row["display_name"], self._job_meta(row))
-        self._result_view.show_job(jid, service.load_segments(jid), row["display_name"])
+        self._result_view.show_job(jid, service.load_segments(jid), row["display_name"],
+                                   fade_suggestions=fade_suggestions)
         if not exists:
             self._retire_wave()
             self._audio_player.unload()
@@ -1307,6 +1405,7 @@ class MainWindow(QMainWindow):
             if w is not None and w.isRunning():
                 w.cancel()
                 w.wait(3000)
+        self._gpu_pack.shutdown()
         gpu_shutdown()
         service.close()
         event.accept()

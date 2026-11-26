@@ -1,19 +1,17 @@
-WhisperDesk 2.0.0 - Avisos de terceiros / Third-party notices
+WhisperDesk 2.2.0 - Avisos de terceiros / Third-party notices
 =============================================================
 
 O WhisperDesk distribui os componentes abaixo. Cada um continua sob a sua
-própria licença; os textos completos estão nos links indicados (e, no caso do
-FFmpeg, em bin\FFMPEG-LICENSE.txt).
+própria licença; os textos completos estão nos links indicados.
 
 WhisperDesk ships the components below. Each remains under its own license.
 
 -------------------------------------------------------------------------------
-FFmpeg 9.0.2 (ffmpeg.exe, ffprobe.exe)  -  GNU GPL v3
-  Build estático de https://www.gyan.dev/ffmpeg/builds/ (veja bin\FFMPEG-README.txt)
-  Código-fonte / source: https://github.com/FFmpeg/FFmpeg/commit/946fcce07b
-  Configuração do build e fontes das bibliotecas: https://www.gyan.dev/ffmpeg/builds/
-  O FFmpeg é executado como processo separado; não é ligado ao WhisperDesk.
-  FFmpeg runs as a separate program and is not linked into WhisperDesk.
+FFmpeg 9.0 (bibliotecas libav*, incluídas na wheel do PyAV 19.0.2)  -  GNU GPL v3 / LGPL
+  Os builds do PyAV incluem codificadores GPL (x264, x265); o conjunto é GPL v3.
+  The PyAV wheels bundle GPL encoders (x264, x265); the combination is GPL v3.
+  Código-fonte / source: https://github.com/FFmpeg/FFmpeg  -  https://github.com/PyAV-Org/pyav-ffmpeg
+  As bibliotecas são DLLs/.so separadas (av.libs) e podem ser substituídas.
 
 Qt 6 / PySide6 6.12  -  GNU LGPL v3
   https://www.qt.io/  -  https://code.qt.io/  -  https://www.gnu.org/licenses/lgpl-3.0.html
@@ -36,8 +34,10 @@ nvidia-ml-py (NVML bindings)  -  BSD-3-Clause
 Python 3.12  -  PSF License  -  https://docs.python.org/3/license.html
 PyInstaller bootloader  -  GPL 2 com exceção de bootloader  -  https://pyinstaller.org/
 
-NVIDIA CUDA Runtime components (cuBLAS, cuBLASLt, cuDNN)
-  Distribuídos conforme a NVIDIA CUDA Toolkit EULA, seção "Distributable Code"
-  (Attachment A). Copyright NVIDIA Corporation.
+NVIDIA CUDA components (cuBLAS, cuBLASLt; cuDNN no Linux)
+  NÃO são distribuídos com o WhisperDesk. Quando o usuário aceita, o app baixa as
+  wheels oficiais da NVIDIA no PyPI (versões e SHA-256 fixados) e extrai só as
+  bibliotecas necessárias. Not shipped: downloaded on demand from NVIDIA's PyPI wheels.
+  Licença: NVIDIA CUDA Toolkit EULA / cuDNN SLA. Copyright NVIDIA Corporation.
   https://docs.nvidia.com/cuda/eula/index.html
   https://docs.nvidia.com/deeplearning/cudnn/latest/reference/eula.html

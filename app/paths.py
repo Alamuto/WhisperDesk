@@ -1,7 +1,8 @@
 """Diretórios de dados por usuário (sem exigir privilégios de administrador).
 
 - Configuração (pequena, itinerante):   %APPDATA%\\WhisperDesk\\config.json
-- Dados volumosos (máquina local):       %LOCALAPPDATA%\\WhisperDesk\\{jobs,models,logs}
+- Dados volumosos (máquina local):       %LOCALAPPDATA%\\WhisperDesk\\{jobs,models,logs,gpu}
+- macOS: ~/Library/Application Support/WhisperDesk · Linux: $XDG_CONFIG_HOME e $XDG_DATA_HOME
 
 `WHISPERDESK_HOME` sobrescreve ambos (testes / modo portátil).
 """
@@ -28,6 +29,8 @@ def roaming_dir() -> Path:
     if os.name == "nt":
         base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
         return Path(base) / APP_NAME
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / APP_NAME
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP_NAME
 
 
@@ -38,6 +41,8 @@ def local_dir() -> Path:
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
         return Path(base) / APP_NAME
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / APP_NAME
     return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / APP_NAME
 
 

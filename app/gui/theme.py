@@ -71,8 +71,10 @@ _LIGHT = {
 }
 THEMES = {"dark": _DARK, "light": _LIGHT}
 
-FONT_UI = '"Segoe UI Variable Text", "Segoe UI", "Inter", sans-serif'
-FONT_MONO = '"Cascadia Mono", "Consolas", monospace'
+# Listas com as fontes nativas de cada sistema (Windows, macOS, Linux): o Qt usa a primeira instalada.
+FONT_UI = ('"Segoe UI Variable Text", "Segoe UI", "SF Pro Text", "Helvetica Neue", "Inter", "Cantarell", '
+           '"Noto Sans", "Ubuntu", "DejaVu Sans", sans-serif')
+FONT_MONO = '"Cascadia Mono", "Consolas", "SF Mono", "Menlo", "JetBrains Mono", "DejaVu Sans Mono", monospace'
 
 
 def qcolor(hex_color: str, alpha: float = 1.0) -> QColor:
@@ -243,6 +245,11 @@ QFrame#subtleCard {
     background: $surface2;
     border: 1px solid $border;
     border-radius: 12px;
+}
+QFrame#suggestBanner {
+    background: $accent_soft;
+    border: 1px solid transparent;
+    border-radius: 10px;
 }
 QScrollArea, QScrollArea > QWidget > QWidget, QStackedWidget { background: transparent; border: none; }
 
