@@ -25,6 +25,8 @@ faster-whisper 1.2.1  -  MIT  -  https://github.com/SYSTRAN/faster-whisper
 OpenAI Whisper (pesos dos modelos, baixados sob demanda)  -  MIT
   https://github.com/openai/whisper
 Silero VAD  -  MIT  -  https://github.com/snakers4/silero-vad
+WeSpeaker ResNet34 (modelo de voz, baixado sob demanda)  -  Apache 2.0
+  https://github.com/wenet-e2e/wespeaker
 ONNX Runtime 1.31  -  MIT  -  https://github.com/microsoft/onnxruntime
 Hugging Face Hub / tokenizers  -  Apache 2.0  -  https://github.com/huggingface
 NumPy  -  BSD-3-Clause  -  https://numpy.org/

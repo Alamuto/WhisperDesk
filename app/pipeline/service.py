@@ -35,7 +35,7 @@ def close() -> None:
 
 
 JOB_CONFIG_KEYS = ("model_size", "language", "task", "device", "compute_type", "vad_filter",
-                   "beam_size", "temperature", "audio_stream")
+                   "beam_size", "temperature", "audio_stream", "diarize", "num_speakers", "speaker_label")
 
 
 def create_or_resume_job(src_path: str, cfg: dict, audio_stream: int, media_duration: float | None) -> tuple[str, str]:
@@ -57,6 +57,19 @@ def create_or_resume_job(src_path: str, cfg: dict, audio_stream: int, media_dura
         return jid, j.job(jid)["state"]
     j.upsert_job(jid, src_path, fp, job_cfg, audio_stream, media_duration)
     return jid, "CREATED"
+
+
+def create_live_job(wav_path: str, cfg: dict) -> str:
+    """Job de uma sessão ao vivo: a origem é a gravação WAV feita pela própria GUI."""
+    import uuid
+
+    j = journal()
+    job_cfg = {k: cfg.get(k) for k in JOB_CONFIG_KEYS}
+    job_cfg.update(audio_stream=0, engine_version=ENGINE_VERSION, live=True)
+    jid = f"live-{uuid.uuid4().hex[:12]}"
+    j.upsert_job(jid, wav_path, "live", job_cfg, 0, None)
+    j.set_state(jid, "TRANSCRIBING")
+    return jid
 
 
 def resumable_jobs() -> list[sqlite3.Row]:
@@ -177,3 +190,59 @@ def import_legacy_history() -> int:
         imported += 1
     app_config.set_value("legacy_history_imported", True)
     return imported
+
+
+# ---------------------------------------------------------------------------
+# Edição da transcrição e falantes
+def edit_segment(job_id: str, key: tuple[int, int], text: str) -> dict:
+    """Salva o texto editado de um trecho e devolve o segmento atualizado (com palavras realinhadas)."""
+    from app.pipeline.journal import realign_words
+
+    j = journal()
+    ci, sq = key
+    seg = j.conn.execute("SELECT start_ms, end_ms FROM segment WHERE job_id=? AND chunk_idx=? AND seq=?",
+                         (job_id, ci, sq)).fetchone()
+    if seg is None:
+        raise KeyError(key)
+    old = [tuple(r) for r in j.conn.execute(
+        "SELECT start_ms, end_ms, word, prob FROM word WHERE job_id=? AND chunk_idx=? AND seg_seq=? ORDER BY seq",
+        (job_id, ci, sq))]
+    text = " ".join(text.split())
+    words = realign_words(old, text, seg[0], seg[1])
+    j.edit_segment(job_id, key, text, words)
+    return _segment(job_id, key)
+
+
+def restore_segment(job_id: str, key: tuple[int, int]) -> dict | None:
+    if not journal().restore_segment(job_id, key):
+        return None
+    return _segment(job_id, key)
+
+
+def _segment(job_id: str, key: tuple[int, int]) -> dict:
+    j = journal()
+    ci, sq = key
+    r = j.conn.execute("SELECT start_ms, end_ms, text, avg_logprob, speaker, orig_text FROM segment "
+                       "WHERE job_id=? AND chunk_idx=? AND seq=?", (job_id, ci, sq)).fetchone()
+    words = [tuple(w) for w in j.conn.execute(
+        "SELECT start_ms, end_ms, word, prob FROM word WHERE job_id=? AND chunk_idx=? AND seg_seq=? ORDER BY seq",
+        (job_id, ci, sq))]
+    return {"start_ms": r[0], "end_ms": r[1], "text": r[2], "avg_logprob": r[3], "speaker": r[4],
+            "words": words, "key": (ci, sq), "edited": r[5] is not None}
+
+
+def speakers(job_id: str) -> list[str]:
+    return journal().speakers(job_id)
+
+
+def rename_speaker(job_id: str, old: str, new: str) -> int:
+    return journal().rename_speaker(job_id, old, new)
+
+
+def set_segment_speaker(job_id: str, key: tuple[int, int], speaker: str | None) -> None:
+    journal().set_segment_speaker(job_id, key, speaker)
+
+
+def is_diarized(job_id: str) -> bool:
+    row = journal().job(job_id)
+    return bool(row is not None and row["diarized"])

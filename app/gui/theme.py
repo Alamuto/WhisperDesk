@@ -456,6 +456,11 @@ def delegate_colors(name: str) -> dict:
         "selected_bg": qcolor(t["accent"], 0.22 if dark else 0.14).name(QColor.NameFormat.HexArgb),
         "word_bg": t["word_bg"], "word_fg": t["word_fg"], "low": t["low"], "mid": t["mid"],
         "match": t["match"], "border": t["border"],
+        # Falantes: tons suaves, legíveis sobre a superfície, distantes do vermelho/amarelo da confiança.
+        "speakers": (["#A99FFF", "#5CC8D6", "#6FD39B", "#E79AD1", "#8FB3FF", "#C9B37A"] if dark
+                     else ["#5242E8", "#0E7F90", "#1F8A55", "#B1408F", "#2F5FD0", "#8A6A1C"]),
+        "edited": qcolor(t["accent"], 0.55).name(QColor.NameFormat.HexArgb),
+        "partial": t["text3"],
     }
 
 

@@ -321,7 +321,24 @@ def _run(j: Journal, job_id: str, models_dir: Path, emit, cancel_event) -> None:
     workdir = j.workdir(job_id)
 
     if job["state"] in ("DONE",):
-        emit("done", {"failed_chunks": 0})
+        # Job concluído reaberto só para identificar falantes (diarização posterior).
+        # O resultado já está pronto: cancelar ou falhar aqui nunca muda o estado DONE.
+        if cfg.get("diarize") and not job["diarized"]:
+            wav = None
+            try:
+                wav = Path(job["wav_path"]) if job["wav_path"] else None
+                if not (wav and wav.is_file()):
+                    wav = _extract_only(job, workdir, emit, cancel_event)
+                _diarize_stage(j, job_id, str(wav), cfg, models_dir, emit, cancel_event, persist_state=False)
+            except (Cancelled, InterruptedError):
+                emit("log", "Identificação de falantes cancelada.")
+            except Exception as e:
+                log.exception("Diarização posterior falhou")
+                emit("warning", f"Não foi possível identificar os falantes: {e}")
+            finally:
+                _drop_wav(str(wav) if wav else None)
+        emit("done", {"failed_chunks": len(j.failed_chunks(job_id)),
+                      "language": job["detected_language"], **j.stats(job_id)})
         return
     if job["state"] == "FAILED":
         j.set_state(job_id, "CREATED")
@@ -486,8 +503,8 @@ def _run(j: Journal, job_id: str, models_dir: Path, emit, cancel_event) -> None:
                 "fraction": j.done_samples(job_id) / total_samples,
                 "rtf": session_audio / session_elapsed if session_elapsed > 0 else 0.0,
                 "segments": [{**{k: v for k, v in s.items() if k != "words"},
-                              "words": [(w["start_ms"], w["end_ms"], w["word"], w["prob"]) for w in s["words"]]}
-                             for s in segments],
+                              "key": (idx, n), "words": [(w["start_ms"], w["end_ms"], w["word"], w["prob"]) for w in s["words"]]}
+                             for n, s in enumerate(segments)],
             })
             del audio, raw, segments
     finally:
@@ -501,12 +518,75 @@ def _run(j: Journal, job_id: str, models_dir: Path, emit, cancel_event) -> None:
     failed = j.failed_chunks(job_id)
     for c in failed:
         j.add_warning(job_id, f"Trecho {_fmt_s(c['start_sample'])}–{_fmt_s(c['end_sample'])} não foi transcrito.")
+    if cfg.get("diarize") and not j.job(job_id)["diarized"]:
+        _diarize_stage(j, job_id, job["wav_path"], cfg, models_dir, emit, cancel_event)
     j.set_state(job_id, "DONE")
     stats = j.stats(job_id)
+    _drop_wav(job["wav_path"])
+    emit("done", {"failed_chunks": len(failed), "language": language, **stats})
+
+
+def _drop_wav(path: str | None) -> None:
+    """O resultado vive no journal; o WAV de trabalho pode ter vários GB."""
     try:
-        wav = Path(job["wav_path"]) if job["wav_path"] else None
-        if wav and wav.is_file():
-            wav.unlink()  # o resultado vive no journal; o WAV de trabalho pode ter vários GB
+        if path and Path(path).is_file():
+            Path(path).unlink()
     except OSError:
         pass
-    emit("done", {"failed_chunks": len(failed), "language": language, **stats})
+
+
+def _extract_only(job, workdir: Path, emit, cancel_event) -> Path:
+    """Reextrai o áudio de um job concluído (o WAV de trabalho é apagado ao fim)."""
+    if not os.path.isfile(job["src_path"]):
+        raise AudioError("SOURCE_MISSING", "O arquivo original não foi encontrado; não é possível identificar falantes.")
+    emit("state", "EXTRACTING")
+    info = ffmpeg_tools.probe(job["src_path"])
+    stream = next((s for s in info.audio_streams if s.index == job["audio_stream"]), None)
+    if stream is None:
+        raise AudioError("STREAM_MISSING", f"A trilha de áudio #{job['audio_stream']} não existe mais no arquivo.")
+    wav = workdir / "audio.wav"
+    ffmpeg_tools.extract_wav(job["src_path"], wav, stream, info.duration, cancel_event=cancel_event,
+                             on_progress=lambda f: emit("extract_progress", f), log_path=workdir / "ffmpeg.log")
+    return wav
+
+
+def _diarize_stage(j: Journal, job_id: str, wav_path: str, cfg: dict, models_dir: Path, emit, cancel_event,
+                   persist_state: bool = True) -> None:
+    """Identifica os falantes. Uma falha aqui nunca derruba a transcrição: vira aviso."""
+    from app.pipeline import diarize
+
+    if persist_state:
+        j.update_fields(job_id, state="DIARIZING")
+    emit("state", "DIARIZING")
+    t0 = time.monotonic()
+    try:
+        def _dlp(done, total):
+            emit("download_progress", {"done": done, "total": total})
+
+        onnx = diarize.ensure_model(models_dir, on_progress=_dlp, cancel_event=cancel_event)
+        emit("state", "DIARIZING")
+        embedder = diarize.SpeakerEmbedder(onnx)
+        keys = j.segment_keys(job_id)
+        n_spk = int(cfg.get("num_speakers") or 0) or None
+        last = [0.0]
+
+        def _p(frac):
+            now = time.monotonic()
+            if now - last[0] >= PROGRESS_INTERVAL_S or frac >= 1.0:
+                last[0] = now
+                emit("diarize_progress", frac)
+
+        labels = diarize.diarize_segments(wav_path, keys, embedder, num_speakers=n_spk,
+                                          on_progress=_p, cancel_event=cancel_event)
+        tpl = cfg.get("speaker_label") or "Speaker {n}"
+        j.set_speakers(job_id, [(k["chunk_idx"], k["seq"], tpl.format(n=lab + 1)) for k, lab in zip(keys, labels)])
+        found = len(set(labels))
+        emit("log", f"Falantes identificados: {found} ({time.monotonic() - t0:.1f}s).")
+        emit("speakers", {"count": found})
+    except (Cancelled, InterruptedError):
+        raise
+    except Exception as e:
+        log.exception("Falha na diarização")
+        msg = f"Não foi possível identificar os falantes: {e}"
+        j.add_warning(job_id, msg)
+        emit("warning", msg)

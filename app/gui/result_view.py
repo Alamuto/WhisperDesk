@@ -12,20 +12,21 @@ import time
 from collections import OrderedDict
 
 from PySide6.QtCore import (
-    QAbstractListModel, QModelIndex, QPointF, QRect, QRectF, QSize, Qt, Signal,
+    QAbstractListModel, QEvent, QModelIndex, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal,
 )
 from PySide6.QtGui import (
     QAction, QColor, QFont, QFontMetrics, QGuiApplication, QIcon, QKeySequence, QPainter, QShortcut, QTextCharFormat,
     QTextLayout, QTextOption,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListView,
+    QAbstractItemDelegate, QAbstractItemView, QFileDialog, QGraphicsOpacityEffect, QHBoxLayout, QInputDialog,
+    QLabel, QLineEdit, QListView, QPlainTextEdit, QToolTip,
     QMessageBox, QPushButton, QSizePolicy, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
 )
 
 from app.gui import icons, theme
 from app.gui.theme import delegate_colors
-from app.gui.widgets import ElidedLabel, IconButton, IconTile, PulseDot, RoundedMenu, Spinner
+from app.gui.widgets import ElidedLabel, IconButton, IconTile, PulseDot, Reveal, RoundedMenu, Spinner, animate_property
 from app.pipeline import service
 from app.pipeline.exporters import EXPORT_FORMATS, fmt_short, to_txt
 from app.utils import config as app_config
@@ -34,6 +35,7 @@ from app.utils.i18n import tr
 PAD_V = 8
 PAD_H = 14
 GAP = 14
+EDIT_W = 22  # espaço do lápis que aparece ao passar o mouse
 LOW_CONF = 0.50
 MID_CONF = 0.75
 
@@ -51,15 +53,20 @@ def _norm_words(words) -> list[tuple[int, int, str, float]]:
 
 class _Seg:
     """Segmento pronto para exibição: texto + offsets de cada palavra no texto."""
-    __slots__ = ("start_ms", "end_ms", "text", "speaker", "words", "spans", "word_starts", "raw")
+    __slots__ = ("start_ms", "end_ms", "text", "speaker", "words", "spans", "word_starts", "raw",
+                 "key", "edited", "prefix_len")
 
     def __init__(self, d: dict):
         self.raw = d
         self.start_ms = int(d["start_ms"])
         self.end_ms = int(d["end_ms"])
         self.speaker = d.get("speaker")
+        k = d.get("key")
+        self.key = (int(k[0]), int(k[1])) if k is not None else None
+        self.edited = bool(d.get("edited"))
         self.words = _norm_words(d.get("words"))
         prefix = f"{self.speaker}: " if self.speaker else ""
+        self.prefix_len = len(prefix) - 1 if prefix else 0
         spans: list[tuple[int, int]] = []
         if self.words:
             parts = [prefix]
@@ -82,18 +89,26 @@ class _Seg:
     def as_dict(self) -> dict:
         return self.raw
 
+    @property
+    def body(self) -> str:
+        """Texto sem o prefixo do falante (o que o editor mostra)."""
+        return self.text[self.prefix_len + 1:] if self.prefix_len else self.text
+
 
 class SegmentModel(QAbstractListModel):
     SegRole = Qt.ItemDataRole.UserRole + 1
+    edit_committed = Signal(int, str)  # linha, novo texto
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._segs: list[_Seg] = []
         self._starts: list[int] = []
+        self._speaker_idx: dict[str, int] = {}
         self.active_row = -1
         self.active_word = -1
         self.match_rows: set[int] = set()
         self.query = ""
+        self.editable = False
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self._segs)
@@ -104,9 +119,25 @@ class SegmentModel(QAbstractListModel):
         seg = self._segs[index.row()]
         if role == Qt.ItemDataRole.DisplayRole:
             return seg.text
+        if role == Qt.ItemDataRole.EditRole:
+            return seg.body
         if role == self.SegRole:
             return seg
         return None
+
+    def flags(self, index):
+        f = super().flags(index)
+        if self.editable and index.isValid() and self._segs[index.row()].key is not None:
+            f |= Qt.ItemFlag.ItemIsEditable
+        return f
+
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole):  # noqa: N802 — API Qt
+        if role != Qt.ItemDataRole.EditRole or not index.isValid():
+            return False
+        text = " ".join(str(value).split())
+        if text and text != self._segs[index.row()].body:
+            self.edit_committed.emit(index.row(), text)
+        return True
 
     def seg(self, row: int) -> _Seg:
         return self._segs[row]
@@ -114,15 +145,44 @@ class SegmentModel(QAbstractListModel):
     def segments(self) -> list[dict]:
         return [s.as_dict() for s in self._segs]
 
+    def speaker_index(self, name: str | None) -> int:
+        return self._speaker_idx.get(name, -1) if name else -1
+
+    def speakers(self) -> list[str]:
+        return list(self._speaker_idx)
+
+    def _index_speakers(self, segs):
+        for s in segs:
+            if s.speaker and s.speaker not in self._speaker_idx:
+                self._speaker_idx[s.speaker] = len(self._speaker_idx)
+
     def set_segments(self, segs: list[dict]):
         self.beginResetModel()
         self._segs = [_Seg(d) for d in segs if (d.get("text") or d.get("words"))]
         self._segs.sort(key=lambda s: s.start_ms)
         self._starts = [s.start_ms for s in self._segs]
+        self._speaker_idx = {}
+        self._index_speakers(self._segs)
         self.active_row = -1
         self.active_word = -1
         self.match_rows = set()
         self.endResetModel()
+
+    def replace_row(self, row: int, d: dict):
+        self._segs[row] = _Seg(d)
+        self._index_speakers([self._segs[row]])
+        idx = self.index(row)
+        self.dataChanged.emit(idx, idx)
+
+    def rename_speaker(self, old: str, new: str):
+        for i, s in enumerate(self._segs):
+            if s.speaker == old:
+                self._segs[i] = _Seg({**s.raw, "speaker": new})
+        if old in self._speaker_idx:
+            # Mantém a cor do falante renomeado.
+            self._speaker_idx = {(new if k == old else k): v for k, v in self._speaker_idx.items()}
+        if self._segs:
+            self.dataChanged.emit(self.index(0), self.index(len(self._segs) - 1))
 
     def append_segments(self, segs: list[dict]):
         new = [_Seg(d) for d in segs if (d.get("text") or d.get("words"))]
@@ -134,6 +194,7 @@ class SegmentModel(QAbstractListModel):
             self.set_segments([s.as_dict() for s in self._segs] + [s.as_dict() for s in new])
             return
         first = len(self._segs)
+        self._index_speakers(new)
         self.beginInsertRows(QModelIndex(), first, first + len(new) - 1)
         self._segs.extend(new)
         self._starts.extend(s.start_ms for s in new)
@@ -186,13 +247,16 @@ class SegmentDelegate(QStyledItemDelegate):
         self._cache.clear()
 
     def _text_width(self, total_width: int) -> int:
-        return max(80, total_width - self.ts_width - GAP - 2 * PAD_H)
+        return max(80, total_width - self.ts_width - GAP - 2 * PAD_H - EDIT_W)
+
+    def _edit_rect(self, r: QRect) -> QRectF:
+        return QRectF(r.right() - PAD_H - EDIT_W + 6, r.top() + PAD_V + (self._line_h - 18) / 2, 18, 18)
 
     def _layout(self, row: int, seg: _Seg, width: int) -> tuple[QTextLayout, float]:
         if width != self._cache_width:
             self._cache.clear()
             self._cache_width = width
-        key = (row, seg.start_ms)
+        key = (row, seg.text)
         hit = self._cache.get(key)
         if hit is not None:
             self._cache.move_to_end(key)
@@ -257,11 +321,23 @@ class SegmentDelegate(QStyledItemDelegate):
         painter.setPen(QColor(c["accent_fg"] if active else c["faint"]))
         ts_rect = QRect(r.left() + PAD_H, r.top() + PAD_V, self.ts_width, self._line_h)
         painter.drawText(ts_rect, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), fmt_short(seg.start_ms))
+        if seg.edited:
+            # Marca discreta de trecho editado à mão, logo abaixo do tempo.
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(c["edited"]))
+            painter.drawRoundedRect(QRectF(ts_rect.left(), ts_rect.bottom() + 5, 14, 2.5), 1.25, 1.25)
 
         # Texto
         tw = self._text_width(r.width())
         lay, _h = self._layout(row, seg, tw)
         formats = []
+        if seg.prefix_len:
+            palette = c["speakers"]
+            si = model.speaker_index(seg.speaker)
+            f = QTextCharFormat()
+            f.setForeground(QColor(palette[si % len(palette)] if si >= 0 else c["muted"]))
+            f.setFontWeight(QFont.Weight.DemiBold)
+            formats.append(_range(0, seg.prefix_len + 1, f))
         if self.show_confidence and seg.words:
             low = QTextCharFormat()
             low.setForeground(QColor(c["low"]))
@@ -291,12 +367,73 @@ class SegmentDelegate(QStyledItemDelegate):
         painter.setPen(QColor(c["text"]))
         painter.setFont(self._font)
         lay.draw(painter, QPointF(r.left() + PAD_H + self.ts_width + GAP, r.top() + PAD_V), formats)
+        if hover and model.editable and seg.key is not None and self._view.state() != QAbstractItemView.State.EditingState:
+            er = self._edit_rect(r)
+            hot = self._view.hover_edit_row == row
+            if hot:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(c["selected_bg"]))
+                painter.drawRoundedRect(er.adjusted(-4, -4, 4, 4), 6, 6)
+            icons.draw(painter, "pencil", er, c["accent_fg"] if hot else c["faint"], 1.7)
         painter.restore()
 
+    # ---- edição inline -------------------------------------------------
+    def text_rect(self, option_rect: QRect, seg: _Seg) -> QRect:
+        x = option_rect.left() + PAD_H + self.ts_width + GAP
+        prefix_w = 0
+        if seg.prefix_len:
+            bold = QFont(self._font)
+            bold.setWeight(QFont.Weight.DemiBold)  # o prefixo é desenhado em seminegrito
+            prefix_w = QFontMetrics(bold).horizontalAdvance(seg.text[:seg.prefix_len + 1]) + 4
+        return QRect(x - 6 + prefix_w, option_rect.top() + 3,
+                     option_rect.right() - PAD_H - x + 12 - prefix_w, option_rect.height() - 6)
+
+    def createEditor(self, parent, option, index):  # noqa: N802 — API Qt
+        ed = _InlineEditor(parent)
+        ed.setFont(self._font)
+        return ed
+
+    def setEditorData(self, editor, index):  # noqa: N802
+        editor.setPlainText(index.data(Qt.ItemDataRole.EditRole) or "")
+        editor.selectAll()
+
+    def setModelData(self, editor, model, index):  # noqa: N802
+        if not editor.cancelled:
+            model.setData(index, editor.toPlainText(), Qt.ItemDataRole.EditRole)
+
+    def updateEditorGeometry(self, editor, option, index):  # noqa: N802
+        seg: _Seg = index.data(SegmentModel.SegRole)
+        editor.setGeometry(self.text_rect(option.rect, seg))
+
+    def eventFilter(self, editor, event):  # noqa: N802
+        if isinstance(editor, _InlineEditor) and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+                self.commitData.emit(editor)
+                self.closeEditor.emit(editor, QAbstractItemDelegate.EndEditHint.NoHint)
+                return True
+            if key == Qt.Key.Key_Escape:
+                editor.cancelled = True
+                self.closeEditor.emit(editor, QAbstractItemDelegate.EndEditHint.RevertModelCache)
+                return True
+        return super().eventFilter(editor, event)
+
+    def helpEvent(self, event, view, option, index):  # noqa: N802
+        if event.type() == QEvent.Type.ToolTip and index.isValid():
+            seg: _Seg = index.data(SegmentModel.SegRole)
+            x = event.pos().x() - option.rect.left()
+            if seg.edited and x < PAD_H + self.ts_width:
+                QToolTip.showText(event.globalPos(), tr("edited_tip"), view)
+                return True
+        return super().helpEvent(event, view, option, index)
+
     def hit_test(self, index, pos) -> tuple[str, int] | None:
-        """('ts'|'word', ms) para o ponto clicado."""
+        """('ts'|'word'|'edit', ms) para o ponto clicado."""
         seg: _Seg = index.data(SegmentModel.SegRole)
         r = self._view.visualRect(index)
+        if (index.model().editable and seg.key is not None
+                and self._edit_rect(r).adjusted(-5, -5, 5, 5).contains(QPointF(pos))):
+            return ("edit", seg.start_ms)
         x = pos.x() - r.left()
         y = pos.y() - r.top() - PAD_V
         if x < PAD_H + self.ts_width:
@@ -316,6 +453,31 @@ class SegmentDelegate(QStyledItemDelegate):
         return ("ts", seg.start_ms)
 
 
+class _InlineEditor(QPlainTextEdit):
+    """Editor de um trecho, sobreposto ao texto da linha. Enter salva, Shift+Enter quebra, Esc cancela."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.cancelled = False
+        self.setObjectName("inlineEditor")
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setTabChangesFocus(True)
+        self.document().setDocumentMargin(3)
+        t = theme.tokens()
+        self.setStyleSheet(
+            f"QPlainTextEdit#inlineEditor {{ background: {t['surface']}; color: {t['text']};"
+            f" border: 1.5px solid {t['accent']}; border-radius: 7px; padding: 0 2px;"
+            f" selection-background-color: {theme.qcolor(t['accent'], 0.30).name(QColor.NameFormat.HexArgb)};"
+            f" selection-color: {t['text']}; }}")
+        # Entrada suave (sem efeito permanente: removido ao fim da animação).
+        eff = QGraphicsOpacityEffect(self)
+        eff.setOpacity(0.0)
+        self.setGraphicsEffect(eff)
+        animate_property(eff, b"opacity", 0.0, 1.0, 140,
+                         finished=lambda: QTimer.singleShot(0, lambda: self.setGraphicsEffect(None)))
+
+
 def _range(start: int, length: int, fmt: QTextCharFormat):
     fr = QTextLayout.FormatRange()
     fr.start = start
@@ -330,7 +492,9 @@ class _ListView(QListView):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.last_user_scroll = 0.0
+        self.hover_edit_row = -1
         self.setObjectName("resultList")
+        self.setEditTriggers(QAbstractItemView.EditTrigger.EditKeyPressed)
         self.setUniformItemSizes(False)
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -348,10 +512,16 @@ class _ListView(QListView):
     def mouseMoveEvent(self, e):
         idx = self.indexAt(e.position().toPoint())
         cursor = Qt.CursorShape.ArrowCursor
+        edit_row = -1
         if idx.isValid():
             hit = self.itemDelegate().hit_test(idx, e.position().toPoint())
-            if hit and hit[0] == "ts":
+            if hit and hit[0] in ("ts", "edit"):
                 cursor = Qt.CursorShape.PointingHandCursor
+            if hit and hit[0] == "edit":
+                edit_row = idx.row()
+        if edit_row != self.hover_edit_row:
+            self.hover_edit_row = edit_row
+            self.viewport().update()
         self.viewport().setCursor(cursor)
         super().mouseMoveEvent(e)
 
@@ -360,6 +530,10 @@ class _ListView(QListView):
         if (idx.isValid() and e.button() == Qt.MouseButton.LeftButton
                 and not (e.modifiers() & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier))):
             hit = self.itemDelegate().hit_test(idx, e.position().toPoint())
+            if hit and hit[0] == "edit":
+                self.setCurrentIndex(idx)
+                self.edit(idx)
+                return
             if hit and hit[0] == "ts":
                 self.seek_requested.emit(hit[1])
         super().mousePressEvent(e)
@@ -368,10 +542,18 @@ class _ListView(QListView):
         idx = self.indexAt(e.position().toPoint())
         if idx.isValid():
             hit = self.itemDelegate().hit_test(idx, e.position().toPoint())
+            if hit and hit[0] == "edit":
+                return
             if hit:
                 self.seek_requested.emit(hit[1])
                 return
         super().mouseDoubleClickEvent(e)
+
+    def leaveEvent(self, e):
+        if self.hover_edit_row != -1:
+            self.hover_edit_row = -1
+            self.viewport().update()
+        super().leaveEvent(e)
 
     def resizeEvent(self, e):
         width_changed = e.size().width() != e.oldSize().width()
@@ -385,6 +567,7 @@ class _ListView(QListView):
 
 class ResultView(QWidget):
     timestamp_clicked = Signal(float)
+    diarize_requested = Signal(str)  # job_id
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -468,6 +651,13 @@ class ResultView(QWidget):
         self._conf_act.toggled.connect(self._on_conf_toggled)
         self._more_menu.addAction(self._conf_act)
         self._more_menu.addSeparator()
+        self._diar_act = self._more_menu.addAction(tr("identify_speakers"))
+        self._diar_act.setToolTip(tr("identify_speakers_tip"))
+        self._diar_act.triggered.connect(lambda: self._job_id and self.diarize_requested.emit(self._job_id))
+        self._edit_act = self._more_menu.addAction(tr("edit_segment"))
+        self._edit_act.setShortcut(QKeySequence(Qt.Key.Key_F2))
+        self._edit_act.triggered.connect(self.edit_current)
+        self._more_menu.addSeparator()
         self._clear_act = self._more_menu.addAction(tr("clear"))
         self._clear_act.triggered.connect(self.clear)
         self._more_btn.clicked.connect(
@@ -485,7 +675,16 @@ class ResultView(QWidget):
         self._view.seek_requested.connect(lambda ms: self.timestamp_clicked.emit(ms / 1000.0))
         self._view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._view.customContextMenuRequested.connect(self._on_context_menu)
+        self._model.edit_committed.connect(self._on_edit_committed)
         layout.addWidget(self._view, stretch=1)
+
+        # Linha provisória do modo ao vivo (o que está sendo dito agora)
+        self._partial = QLabel("")
+        self._partial.setObjectName("partialLine")
+        self._partial.setWordWrap(True)
+        self._partial.setContentsMargins(PAD_H + 2, 2, PAD_H, 4)
+        self._partial_reveal = Reveal(self._partial, shown=False)
+        layout.addWidget(self._partial_reveal)
 
         # Estado vazio (antes do primeiro segmento)
         self._placeholder = QWidget()
@@ -520,6 +719,8 @@ class ResultView(QWidget):
         self._on_theme(theme.current())
 
     def _on_theme(self, name: str):
+        t = theme.tokens()
+        self._partial.setStyleSheet(f"QLabel#partialLine {{ color: {t['text3']}; font-style: italic; }}")
         self._search_act.setIcon(icons.icon("search", theme.tokens()["text3"], 16))
         self._export_btn.setIcon(icons.icon("download", theme.tokens()["accent_fg"], 16, 2.0))
         self.set_theme(name)
@@ -537,6 +738,8 @@ class ResultView(QWidget):
         self._conf_act.setText(tr("show_confidence"))
         self._conf_act.setToolTip(tr("show_confidence_tip"))
         self._clear_act.setText(tr("clear"))
+        self._diar_act.setToolTip(tr("identify_speakers_tip"))
+        self._edit_act.setText(tr("edit_segment"))
         self._copy_btn.setToolTip(tr("copy_all"))
         self._more_btn.setToolTip(tr("more_options"))
         self._prev_btn.setToolTip(tr("prev_match"))
@@ -577,7 +780,21 @@ class ResultView(QWidget):
 
     def end_live(self):
         self._live = False
+        self.set_partial("")
         self._update_state()
+
+    def set_partial(self, text: str):
+        """Mostra (ou esconde) o texto provisório da fala em andamento."""
+        text = (text or "").strip()
+        if text:
+            self._partial.setText(text)
+            if not self._partial_reveal.is_shown():
+                self._partial_reveal.set_shown(True)
+            sb = self._view.verticalScrollBar()
+            if sb.value() >= sb.maximum() - 8:
+                QTimer.singleShot(0, self._view.scrollToBottom)
+        elif self._partial_reveal.is_shown():
+            self._partial_reveal.set_shown(False)
 
     def show_job(self, job_id: str, segments: list[dict], title: str | None = None):
         self._job_id = job_id
@@ -601,6 +818,7 @@ class ResultView(QWidget):
     def clear(self):
         self._job_id = None
         self._live = False
+        self.set_partial("")
         self._model.set_segments([])
         self._delegate.invalidate()
         self._reset_search()
@@ -621,6 +839,13 @@ class ResultView(QWidget):
             self._ph_spinner.setVisible(waiting)
         self._live_badge.setVisible(self._live)
         has_job = self._job_id is not None and n > 0
+        self._model.editable = has_job and not self._live
+        self._edit_act.setEnabled(self._model.editable)
+        self._diar_act.setVisible(has_job and not self._live and not self._job_id.startswith("legacy-"))
+        self._diar_act.setEnabled(has_job and not self._live)
+        if has_job:
+            diarized = bool(self._model.speakers())
+            self._diar_act.setText(tr("redo_speakers") if diarized else tr("identify_speakers"))
         self._export_btn.setEnabled(has_job and not self._live)
         self._copy_btn.setEnabled(n > 0)
         self._clear_act.setEnabled(n > 0 and not self._live)
@@ -628,7 +853,9 @@ class ResultView(QWidget):
         if n:
             words = self._model.word_count()
             last = self._model.seg(n - 1).end_ms
-            self._stats.setText(f"{fmt_short(last)}  ·  {words} {tr('words')}")
+            spk = len(self._model.speakers())
+            extra = f"  ·  {tr('speakers_count', count=spk)}" if spk > 1 else ""
+            self._stats.setText(f"{fmt_short(last)}  ·  {words} {tr('words')}{extra}")
             self._stats.setToolTip(f"{n} {tr('segments')}")
         else:
             self._stats.setText("")
@@ -727,14 +954,130 @@ class ResultView(QWidget):
         idx = self._view.indexAt(pos)
         menu = RoundedMenu(parent=self)
         if idx.isValid():
-            seg = self._model.seg(idx.row())
+            row = idx.row()
+            seg = self._model.seg(row)
             menu.addAction(tr("play_from_here"), lambda: self.timestamp_clicked.emit(seg.start_ms / 1000.0))
             menu.addAction(tr("copy_selection"), self.copy_text)
+            if self._model.editable and seg.key is not None:
+                menu.addSeparator()
+                menu.addAction(icons.icon("pencil", theme.tokens()["text2"], 16), tr("edit_segment"),
+                               lambda: self._edit_row(row))
+                if seg.edited:
+                    menu.addAction(icons.icon("undo", theme.tokens()["text2"], 16), tr("restore_original"),
+                                   lambda: self._restore_row(row))
+                spk = self._model.speakers()
+                if seg.speaker:
+                    menu.addAction(icons.icon("users", theme.tokens()["text2"], 16),
+                                   tr("rename_speaker", name=seg.speaker), lambda: self._rename_speaker(seg.speaker))
+                if spk:
+                    sub = RoundedMenu(tr("change_speaker"), self)
+                    for name in spk:
+                        act = sub.addAction(name)
+                        act.setCheckable(True)
+                        act.setChecked(name == seg.speaker)
+                        act.triggered.connect(lambda _=False, n=name: self._set_speaker(n))
+                    sub.addSeparator()
+                    sub.addAction(tr("new_speaker"), self._new_speaker)
+                    menu.addMenu(sub)
             menu.addSeparator()
         menu.addAction(tr("copy_all"), lambda: QGuiApplication.clipboard().setText(to_txt(self._model.segments())))
         if self._job_id and self._model.rowCount() and not self._live:
             menu.addMenu(self._export_menu)
         menu.exec(self._view.viewport().mapToGlobal(pos))
+
+    # ------------------------------------------------------------ edição
+    def _toast(self, msg: str, kind: str = "success", ms: int = 2500):
+        w = self.window()
+        if hasattr(w, "show_toast"):
+            w.show_toast(msg, kind=kind, duration_ms=ms)
+
+    def edit_current(self):
+        idx = self._view.currentIndex()
+        if not idx.isValid():
+            idx = self._view.indexAt(self._view.viewport().rect().topLeft() + QPoint(4, 4))
+        if idx.isValid():
+            self._edit_row(idx.row())
+
+    def _edit_row(self, row: int):
+        if not self._model.editable:
+            return
+        idx = self._model.index(row)
+        self._view.scrollTo(idx, QAbstractItemView.ScrollHint.EnsureVisible)
+        self._view.setCurrentIndex(idx)
+        self._view.edit(idx)
+
+    def _relayout_row(self, row: int):
+        self._view.scheduleDelayedItemsLayout()
+        if self._model.query:
+            self._recompute_matches()
+        self._update_state()
+
+    def _on_edit_committed(self, row: int, text: str):
+        seg = self._model.seg(row)
+        if not self._job_id or seg.key is None:
+            return
+        try:
+            new = service.edit_segment(self._job_id, seg.key, text)
+        except Exception as e:  # noqa: BLE001 — mostrado ao usuário
+            self._toast(f"{tr('edit_failed')}: {e}", "error", 5000)
+            return
+        self._model.replace_row(row, new)
+        self._relayout_row(row)
+        self._toast(tr("segment_saved"))
+
+    def _restore_row(self, row: int):
+        seg = self._model.seg(row)
+        if not self._job_id or seg.key is None:
+            return
+        new = service.restore_segment(self._job_id, seg.key)
+        if new is not None:
+            self._model.replace_row(row, new)
+            self._relayout_row(row)
+            self._toast(tr("segment_restored"), "info")
+
+    def _ask_name(self, title: str, label: str, text: str = "") -> str | None:
+        name, ok = QInputDialog.getText(self, title, label, QLineEdit.EchoMode.Normal, text)
+        name = " ".join((name or "").split())
+        return name if ok and name else None
+
+    def _rename_speaker(self, old: str):
+        if not self._job_id:
+            return
+        new = self._ask_name(tr("rename_speaker_title"), tr("rename_speaker_label", name=old), old)
+        if not new or new == old:
+            return
+        service.rename_speaker(self._job_id, old, new)
+        self._model.rename_speaker(old, new)
+        self._delegate.invalidate()
+        self._relayout_row(0)
+        self._toast(tr("speaker_renamed", name=new))
+
+    def _target_rows(self) -> list[int]:
+        rows = sorted({i.row() for i in self._view.selectionModel().selectedIndexes()})
+        if not rows and self._view.currentIndex().isValid():
+            rows = [self._view.currentIndex().row()]
+        return rows
+
+    def _set_speaker(self, name: str | None):
+        if not self._job_id:
+            return
+        changed = 0
+        for row in self._target_rows():
+            seg = self._model.seg(row)
+            if seg.key is None or seg.speaker == name:
+                continue
+            service.set_segment_speaker(self._job_id, seg.key, name)
+            self._model.replace_row(row, {**seg.raw, "speaker": name})
+            changed += 1
+        if changed:
+            self._delegate.invalidate()
+            self._relayout_row(0)
+
+    def _new_speaker(self):
+        n = len(self._model.speakers()) + 1
+        name = self._ask_name(tr("new_speaker_title"), tr("new_speaker_label"), tr("speaker_n", n=n))
+        if name:
+            self._set_speaker(name)
 
     def export(self, fmt: str):
         if not self._job_id or not self._model.rowCount():

@@ -64,13 +64,15 @@ Python, CUDA Toolkit nem FFmpeg.
 - Gravações **longas** (de minutos a 12 h ou mais) e arquivos de dezenas de GB, com uso de memória constante.
 - **Robustez de produção**: trabalhos retomáveis após pausa, fechamento do app, queda de energia ou travamento do worker.
 - Uso automático de **GPU NVIDIA**, com redução de precisão e volta para a CPU quando falta VRAM.
-- Revisão do resultado: player sincronizado, busca, cores por confiança e exportação para formatos de legenda e dados.
+- Revisão do resultado: player sincronizado, busca, cores por confiança, **edição do texto** e exportação para
+  formatos de legenda e dados.
+- **Identificação de falantes** (diarização local) e **transcrição ao vivo do microfone**.
+- **Fila** de vários arquivos, transcritos um depois do outro.
 - Distribuição para **Windows 10/11 x64** como instalador por usuário (sem UAC) ou pasta portátil.
 
 **Fora do escopo (por decisão)**
 
 - Serviços em nuvem, contas, telemetria ou qualquer envio de áudio/texto para fora da máquina.
-- Transcrição em tempo real do microfone e identificação de falantes (diarização) — candidatos a versões futuras.
 - macOS e Linux (o código é quase todo portátil, mas o empacotamento e os testes cobrem só Windows).
 - Edição de vídeo ou queima de legendas no vídeo.
 
@@ -85,6 +87,18 @@ Python, CUDA Toolkit nem FFmpeg.
 - **Filtro de alucinações** (repetições em loop, "Obrigado por assistir" em silêncio etc.).
 - **Resultado interativo**: timestamps clicáveis, destaque palavra a palavra sincronizado com o player, cores por
   confiança, busca com navegação entre resultados.
+- **Edição no próprio resultado**: clique no lápis (ou `F2`), corrija o texto e `Enter` salva; os tempos das palavras
+  são preservados ou redistribuídos, e o original pode ser restaurado. As exportações já saem com as correções.
+- **Identificação de falantes**: opção "Identificar falantes" antes de transcrever, ou depois, em **⋯ → Identificar
+  falantes** num resultado pronto. Roda localmente (modelo de voz WeSpeaker de ~26 MB, baixado uma vez), com número de
+  falantes automático ou fixo. Cada falante ganha uma cor; dá para renomear ("Falante 1" → "Ana") e trocar o falante de
+  um trecho pelo menu de contexto. Os nomes vão para TXT, SRT, VTT, JSON e CSV.
+- **Ao vivo pelo microfone** (`Ctrl+R`): o texto aparece enquanto você fala, com uma linha provisória em itálico que se
+  firma ao fim de cada frase. A gravação fica salva em WAV, vira um item do histórico e pode ser reexportada ou
+  ter os falantes identificados depois. Microfone escolhido em **⋯ → Microfone**.
+- **Fila de arquivos**: selecione ou arraste vários arquivos (ou uma pasta). O primeiro é carregado e os demais vão para
+  "A seguir", na barra lateral; ao terminar um, o próximo começa sozinho. Arquivos já transcritos são pulados, falhas
+  não interrompem a fila, e ela sobrevive ao fechamento do app.
 - **Exportação** TXT, SRT, VTT, JSON e CSV (escrita atômica).
 - **Histórico** de transcrições com filtro, tema claro/escuro e interface em português e inglês (segue o sistema).
 - **Diagnóstico embutido**: `--selftest` e `--selftest-transcribe` para suporte e CI.
@@ -99,12 +113,20 @@ A versão 2.0 traz uma interface redesenhada, pensada como produto:
 - Gavetas animadas para **histórico** e **log técnico**, sem espremer o conteúdo.
 - Temas **claro e escuro** com paletas próprias e transição em cross-fade.
 - Animações discretas: seletores com pílula deslizante, carregamento em esqueleto, progresso suavizado, notificações.
-- Atalhos: `Ctrl+O` abrir, `Ctrl+Enter` transcrever, `Ctrl+E` exportar, `Ctrl+F` buscar, `Ctrl+H` histórico,
-  `Ctrl+L` log, `Espaço` / `←` / `→` player, `Esc` fecha gavetas.
+- Atalhos: `Ctrl+O` abrir, `Ctrl+Enter` transcrever, `Ctrl+R` gravar do microfone, `Ctrl+E` exportar, `Ctrl+F`
+  buscar, `F2` editar trecho, `Ctrl+H` histórico, `Ctrl+L` log, `Espaço` / `←` / `→` player, `Esc` fecha gavetas.
+
+Na 2.1, os elementos novos seguem a mesma linguagem: as linhas da fila entram e saem deslizando, o editor surge com um
+fade curto, o medidor do microfone sobe rápido e desce devagar, e a linha provisória do modo ao vivo aparece e some
+suavemente — movimento para orientar, nunca para enfeitar.
 
 | Tela inicial (escuro) | Transcrição (claro) | Histórico (claro) |
 |:---:|:---:|:---:|
 | <img src="docs/screenshots/empty-dark.png" width="300" alt="Tela inicial com área para soltar arquivos"> | <img src="docs/screenshots/transcript-light.png" width="300" alt="Transcrição no tema claro"> | <img src="docs/screenshots/history-light.png" width="300" alt="Gaveta de histórico aberta"> |
+
+| Falantes, edição e fila (2.1) | Ao vivo pelo microfone (2.1) |
+|:---:|:---:|
+| <img src="docs/screenshots/speakers-queue-dark.png" width="450" alt="Resultado com falantes coloridos, trecho editado e fila de arquivos na barra lateral"> | <img src="docs/screenshots/live-dark.png" width="450" alt="Modo ao vivo com medidor de nível e linha provisória"> |
 
 ## Instalação
 
@@ -150,6 +172,7 @@ Os modelos vêm do Hugging Face (formato CTranslate2); o download é retomado de
 | Modelos baixados                              | `%LOCALAPPDATA%\WhisperDesk\models`    |
 | Trabalhos (retomáveis) e histórico            | `%LOCALAPPDATA%\WhisperDesk\jobs`      |
 | Logs (`app.log`, `worker-*.log`, `crash.log`) | `%LOCALAPPDATA%\WhisperDesk\logs`      |
+| Gravações do microfone (WAV)                  | `%LOCALAPPDATA%\WhisperDesk\recordings` |
 
 O menu **⋯ → Pasta de dados** abre esse diretório. A variável `WHISPERDESK_HOME` redireciona tudo para outra pasta
 (modo portátil). O desinstalador pergunta se esses dados devem ser apagados.
@@ -210,6 +233,8 @@ app/pipeline/
   ffmpeg_tools.py       probe, extração de WAV 16 kHz, picos da forma de onda (subprocessos ffmpeg)
   planner.py            divide o áudio em blocos nos silêncios (Silero VAD)
   worker.py             processo de transcrição isolado (spawn), checkpoint por bloco, fallback GPU→CPU
+  live_worker.py        transcrição ao vivo: detector de voz, linha provisória e frases finais no diário
+  diarize.py            identificação de falantes (embeddings WeSpeaker via onnxruntime + agrupamento)
   journal.py            diário SQLite (WAL) dos blocos — retomada após pausa ou queda
   hallucination.py      filtro de alucinações
   segmenter.py          re-segmentação para legendas
@@ -221,7 +246,9 @@ app/gui/
   theme.py              tokens de design (claro/escuro) e folha de estilo
   widgets.py            componentes animados (botões, seletores, toasts, gavetas, progresso)
   main_window.py        janela, layout, atalhos, arrastar e soltar
-  result_view.py        lista virtualizada de segmentos, busca, karaokê, exportação
+  result_view.py        lista virtualizada de segmentos, busca, karaokê, edição inline, falantes, exportação
+  queue_list.py         fila de arquivos ("A seguir")
+  live.py               captura do microfone (QtMultimedia), medidor de nível e painel ao vivo
   player_controls.py    player com forma de onda
   history.py            histórico e recentes
   job_controller.py     ponte entre a UI e o processo worker
@@ -240,10 +267,10 @@ diário → a UI recebe os segmentos em tempo real → ao fim, o resultado vai p
 ## Roadmap
 
 - [ ] Assinatura digital do executável e do instalador
-- [ ] Diarização (quem falou o quê)
-- [ ] Transcrição em tempo real do microfone
-- [ ] Editor de texto do resultado com reexportação
-- [ ] Fila de vários arquivos
+- [x] Diarização (quem falou o quê) — 2.1
+- [x] Transcrição em tempo real do microfone — 2.1
+- [x] Editor de texto do resultado com reexportação — 2.1
+- [x] Fila de vários arquivos — 2.1
 
 ## Licenças
 

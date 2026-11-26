@@ -288,6 +288,58 @@ def _speed(p, c):
     p.drawLine(QPointF(12, 13.5), QPointF(15.5, 9.5))
 
 
+def _mic(p, c):
+    p.drawRoundedRect(QRectF(9, 3.5, 6, 11), 3, 3)
+    arc = QPainterPath()
+    arc.arcMoveTo(QRectF(5.5, 5.5, 13, 12), 180)
+    arc.arcTo(QRectF(5.5, 5.5, 13, 12), 180, 180)
+    p.drawPath(arc)
+    p.drawLine(QPointF(12, 17.5), QPointF(12, 20.5))
+    p.drawLine(QPointF(9, 20.5), QPointF(15, 20.5))
+
+
+def _pencil(p, c):
+    p.drawPath(_p((15.5, 5), (19, 8.5), (8.5, 19), (4.5, 19.5), (5, 15.5), (15.5, 5)))
+    p.drawLine(QPointF(13.5, 7), QPointF(17, 10.5))
+
+
+def _users(p, c):
+    p.drawEllipse(QPointF(9.5, 8.5), 3.2, 3.2)
+    arc = QPainterPath()
+    arc.arcMoveTo(QRectF(3.5, 14.5, 12, 10), 180)
+    arc.arcTo(QRectF(3.5, 14.5, 12, 10), 180, -180)
+    p.drawPath(arc)
+    side = QPainterPath()
+    side.arcMoveTo(QRectF(13.2, 5.3, 6.4, 6.4), 100)
+    side.arcTo(QRectF(13.2, 5.3, 6.4, 6.4), 100, -200)
+    p.drawPath(side)
+    p.drawPath(_p((17, 14.6), (19.2, 15.6), (20.5, 19)))
+
+
+def _list(p, c):
+    for y in (7, 12, 17):
+        p.drawLine(QPointF(9, y), QPointF(20, y))
+        _fill(p, c)
+        p.drawEllipse(QPointF(5, y), 1.2, 1.2)
+        p.setPen(QPen(c, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+
+
+def _plus(p, c):
+    p.drawLine(QPointF(12, 5), QPointF(12, 19))
+    p.drawLine(QPointF(5, 12), QPointF(19, 12))
+
+
+def _undo(p, c):
+    path = QPainterPath(QPointF(7.5, 9))
+    path.lineTo(QPointF(14, 9))
+    path.cubicTo(QPointF(17.6, 9), QPointF(19.5, 11.3), QPointF(19.5, 14))
+    path.cubicTo(QPointF(19.5, 16.8), QPointF(17.4, 19), QPointF(14, 19))
+    path.lineTo(QPointF(9, 19))
+    p.drawPath(path)
+    p.drawPath(_p((10.5, 5.5), (7, 9), (10.5, 12.5)))
+
+
 _ICONS = {
     "play": _play, "pause": _pause, "stop": _stop, "upload": _upload, "download": _download,
     "file-audio": _file_audio, "file-video": _file_video, "wave": _wave, "history": _history,
@@ -295,7 +347,8 @@ _ICONS = {
     "search": _search, "chevron-down": _chev_down, "chevron-up": _chev_up, "chevron-right": _chev_right,
     "close": _close, "check": _check, "terminal": _terminal, "sparkle": _sparkle, "swap": _swap,
     "info": _info, "warning": _warning, "success": _success, "error": _error, "trash": _trash,
-    "chip": _chip, "sliders": _sliders, "speed": _speed,
+    "chip": _chip, "sliders": _sliders, "speed": _speed, "mic": _mic, "pencil": _pencil,
+    "users": _users, "list": _list, "plus": _plus, "undo": _undo,
 }
 
 

@@ -28,8 +28,10 @@ from app.gui.config_panel import ConfigPanel
 from app.gui.dropzone import WAVEFORM_BINS, DropZone, is_supported
 from app.gui.history import HistoryPanel, RecentList
 from app.gui.job_controller import JobController
+from app.gui.live import LivePanel, LiveSession, device_key, discard_empty, find_device, input_devices
 from app.gui.player_controls import PlayerControls
 from app.gui.progress import LogPanel, ProgressArea
+from app.gui.queue_list import QueueList
 from app.gui.result_view import ResultView
 from app.gui.widgets import (
     DragOverlay, DropTarget, ElidedLabel, FadeStack, IconButton, IconTile, LogoMark, PulseDot, RoundedMenu,
@@ -48,6 +50,7 @@ _STAGES = {
     "PLANNING": ("stage_planning", False),
     "LOADING_MODEL": ("stage_loading_model", True),
     "TRANSCRIBING": ("stage_transcribing", False),
+    "DIARIZING": ("stage_diarizing", False),
 }
 
 _LEGACY_TOAST_COLORS = {"#4CAF7D": "success", "#C98A2B": "warning", "#6C63FF": "info"}
@@ -170,10 +173,17 @@ class MainWindow(QMainWindow):
         self._hist_wave = None
         self._old_waves: list = []
         self._theme_fade = None
+        self._queue_active = False          # a fila avança sozinha ao fim de cada job
+        self._queue_stats = {"done": 0, "failed": 0, "skipped": 0}
+        self._pending_queue_start: str | None = None
 
         self._controller = JobController(self)
         self._controller.event.connect(self._on_job_event)
         self._controller.finished.connect(self._on_job_finished)
+        self._live = LiveSession(self)
+        self._live.event.connect(self._on_live_event)
+        self._live.finished.connect(self._on_live_finished)
+        self._live.no_signal.connect(lambda: self.show_toast(tr("live_no_signal"), kind="warning", duration_ms=9000))
 
         self._setup_window()
         self._setup_ui()
@@ -271,6 +281,8 @@ class MainWindow(QMainWindow):
         il.addWidget(self._sec_file)
         self._dropzone = DropZone()
         il.addWidget(self._dropzone)
+        self._queue = QueueList()
+        il.addWidget(self._queue)
         il.addSpacing(12)
         self._sec_settings = section_label(tr("section_settings"))
         il.addWidget(self._sec_settings)
@@ -284,10 +296,23 @@ class MainWindow(QMainWindow):
         al = QVBoxLayout(action)
         al.setContentsMargins(18, 10, 18, 18)
         self._action_stack = FadeStack(slide=8)
-        self._action_stack.addWidget(self._config_panel.start_button)
+        self._idle_action = _styled(QWidget(), "transparent")
+        ia = QVBoxLayout(self._idle_action)
+        ia.setContentsMargins(0, 0, 0, 0)
+        ia.setSpacing(4)
+        ia.addWidget(self._config_panel.start_button)
+        self._mic_btn = QPushButton(tr("record_mic"))
+        self._mic_btn.setObjectName("ghost")
+        self._mic_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mic_btn.clicked.connect(self._on_mic_clicked)
+        ia.addWidget(self._mic_btn)
+        self._action_stack.addWidget(self._idle_action)
         self._progress_area = ProgressArea()
         self._action_stack.addWidget(self._progress_area)
-        self._action_stack.set_current(self._config_panel.start_button, animate=False)
+        self._live_panel = LivePanel()
+        self._live_panel.stop_requested.connect(self._on_live_stop)
+        self._action_stack.addWidget(self._live_panel)
+        self._action_stack.set_current(self._idle_action, animate=False)
         self._action_stack.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         al.addWidget(self._action_stack)
         outer.addWidget(action)
@@ -301,8 +326,17 @@ class MainWindow(QMainWindow):
         col = QVBoxLayout()
         col.setSpacing(22)
         self._hero = _HeroDrop()
-        self._hero.clicked.connect(lambda: self._dropzone._on_select_file())
+        self._hero.clicked.connect(lambda: self._dropzone.choose_files())
         col.addWidget(self._hero)
+        mic_row = QHBoxLayout()
+        mic_row.addStretch()
+        self._hero_mic = QPushButton(tr("record_mic"))
+        self._hero_mic.setObjectName("ghost")
+        self._hero_mic.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._hero_mic.clicked.connect(self._on_mic_clicked)
+        mic_row.addWidget(self._hero_mic)
+        mic_row.addStretch()
+        col.addLayout(mic_row)
         self._recent = RecentList(4)
         col.addWidget(self._recent)
         holder = QWidget()
@@ -378,11 +412,20 @@ class MainWindow(QMainWindow):
         t = theme.tokens()
         self._log_btn.setIcon(icons.icon("terminal", t["text2"], 14, 1.8))
         self._theme_btn.set_icon(self._theme_icon())
+        for b in (getattr(self, "_mic_btn", None), getattr(self, "_hero_mic", None)):
+            if b is not None:
+                b.setIcon(icons.icon("mic", t["text2"], 15, 1.8))
 
     def _wire_signals(self):
         self._dropzone.file_selected.connect(self._on_file_selected)
         self._dropzone.peaks_changed.connect(self._on_drop_peaks)
         self._dropzone.peaks_failed.connect(lambda m: self._log_panel.append(f"waveform: {m}"))
+        self._dropzone.files_chosen.connect(self._on_files_chosen)
+        self._dropzone.load_failed.connect(self._on_load_failed)
+        self._queue.changed.connect(self._config_panel.set_queue_count)
+        self._queue.add_button.clicked.connect(lambda: self._dropzone.choose_files(allow_busy=True))
+        self._live.level.connect(self._live_panel.set_level)
+        self._result_view.diarize_requested.connect(self._on_diarize_requested)
         self._config_panel.start_clicked.connect(self._on_start_transcription)
         self._progress_area.cancel_requested.connect(self._on_cancel)
         self._history_panel.entry_selected.connect(self._on_history_entry_selected)
@@ -412,7 +455,8 @@ class MainWindow(QMainWindow):
             return _run
 
         shortcuts = [
-            (QKeySequence.StandardKey.Open, self._dropzone._on_select_file, False),
+            (QKeySequence.StandardKey.Open, lambda: self._dropzone.choose_files(allow_busy=True), False),
+            ("Ctrl+R", self._on_mic_clicked, False),
             ("Ctrl+Return", self._config_panel._on_start, False),
             ("Ctrl+Enter", self._config_panel._on_start, False),
             ("Ctrl+E", self._show_export_menu, False),
@@ -467,6 +511,23 @@ class MainWindow(QMainWindow):
             group.addAction(act)
             lang_menu.addAction(act)
         menu.addMenu(lang_menu)
+        mic_menu = RoundedMenu(tr("mic_device"), menu)
+        mic_menu.setIcon(icons.icon("mic", t["text2"], 16))
+        mic_group = QActionGroup(mic_menu)
+        cur_mic = app_config.get("mic_device") or ""
+        devices = input_devices()
+        known = {device_key(d) for d in devices}
+        for key, name in [("", tr("mic_default"))] + [(device_key(d), d.description()) for d in devices]:
+            act = QAction(name, mic_menu)
+            act.setCheckable(True)
+            act.setChecked(key == cur_mic or (key == "" and cur_mic not in known))
+            act.triggered.connect(lambda _=False, k=key: app_config.set_value("mic_device", k))
+            mic_group.addAction(act)
+            mic_menu.addAction(act)
+            if key == "" and devices:
+                mic_menu.addSeparator()
+        mic_menu.setEnabled(not self._live.is_running())
+        menu.addMenu(mic_menu)
         menu.addAction(icons.icon("folder", t["text2"], 16), tr("data_folder"), self._open_data_folder)
         menu.addAction(icons.icon("terminal", t["text2"], 16), tr("tech_log"), self._log_btn.toggle)
         menu.addSeparator()
@@ -530,10 +591,15 @@ class MainWindow(QMainWindow):
         if not is_cuda_available():
             self._gpu_chip.setText(tr("cpu_mode_short"))
             self._gpu_chip.setToolTip(tr("gpu_cpu_mode"))
+        self._mic_btn.setText(tr("record_mic"))
+        self._mic_btn.setToolTip(f"{tr('record_mic_tip')}  (Ctrl+R)")
+        self._hero_mic.setText(tr("record_mic"))
+        self._hero_mic.setToolTip(tr("record_mic_tip"))
         for w in (self._config_panel, self._progress_area, self._result_view, self._history_panel,
-                  self._player_controls, self._log_panel, self._dropzone, self._recent):
+                  self._player_controls, self._log_panel, self._dropzone, self._recent, self._queue,
+                  self._live_panel):
             w.retranslate()
-        if not self._controller.is_running():
+        if not self._is_busy():
             self._status_label.setText(tr("ready"))
 
     def _open_data_folder(self):
@@ -543,22 +609,37 @@ class MainWindow(QMainWindow):
 
     # ================================================================ arrastar e soltar
     @staticmethod
-    def _drag_path(event) -> str:
+    def _drag_paths(event) -> list[str]:
         md = event.mimeData()
         if not md.hasUrls():
-            return ""
+            return []
+        out = []
         for url in md.urls():
             if url.isLocalFile():
                 path = url.toLocalFile()
-                if os.path.isfile(path) and is_supported(path):
-                    return path
-        return ""
+                if os.path.isdir(path):
+                    try:
+                        names = sorted(os.listdir(path))
+                    except OSError:
+                        names = []
+                    out += [os.path.join(path, n) for n in names
+                            if os.path.isfile(os.path.join(path, n)) and is_supported(n)]
+                elif os.path.isfile(path) and is_supported(path):
+                    out.append(path)
+        return [os.path.normpath(x) for x in out]
 
     def dragEnterEvent(self, event):
-        if self._drag_path(event) and not self._controller.is_running():
+        paths = self._drag_paths(event)
+        if paths:
             event.acceptProposedAction()
-            self._overlay.title = tr("drop_overlay")
-            self._overlay.subtitle = tr("drop_overlay_hint")
+            to_queue = self._is_busy() or len(paths) > 1
+            if to_queue:
+                n = len(paths) if self._is_busy() else len(paths) - 1
+                self._overlay.title = tr("drop_overlay_queue", count=n)
+                self._overlay.subtitle = tr("drop_overlay_queue_hint")
+            else:
+                self._overlay.title = tr("drop_overlay")
+                self._overlay.subtitle = tr("drop_overlay_hint")
             self._overlay.appear()
             self._dropzone.set_drag_active(True)
             self._hero.set_drag_active(True)
@@ -573,11 +654,11 @@ class MainWindow(QMainWindow):
         super().dragLeaveEvent(event)
 
     def dropEvent(self, event):
-        path = self._drag_path(event)
+        paths = self._drag_paths(event)
         self._end_drag()
-        if path:
+        if paths:
             event.acceptProposedAction()
-            self._dropzone.load_file(path)
+            self._on_files_chosen(paths)
 
     def _end_drag(self):
         self._overlay.disappear()
@@ -593,6 +674,7 @@ class MainWindow(QMainWindow):
 
     # ================================================================ inicialização
     def _startup_tasks(self):
+        self._queue.restore()
         try:
             n = service.import_legacy_history()
             if n:
@@ -707,11 +789,21 @@ class MainWindow(QMainWindow):
             self._start_job(pending["job_id"], resumed=True)
             return
         self._result_view.clear()
+        queued = self._pending_queue_start
+        if queued and os.path.normcase(queued) == os.path.normcase(os.path.normpath(filepath)):
+            self._pending_queue_start = None
+            QTimer.singleShot(150, lambda: self._on_start_transcription(self._config_panel.get_config_dict()))
 
     # ================================================================ transcrição
     def _on_start_transcription(self, cfg: dict):
-        if self._controller.is_running():
+        if self._is_busy():
             return
+        if len(self._queue) and not self._queue_active:
+            self._queue_active = True
+            self._queue_stats = {"done": 0, "failed": 0, "skipped": 0}
+            if not self._current_filepath or self._current_info is None:
+                self._advance_queue()  # nada carregado: começa pelo primeiro da fila
+                return
         if not self._current_filepath or self._current_info is None:
             self.show_toast(tr("no_file_msg"), kind="warning")
             return
@@ -727,7 +819,19 @@ class MainWindow(QMainWindow):
         try:
             jid, state = service.create_or_resume_job(self._current_filepath, cfg, stream, self._current_info.duration)
         except OSError as e:
+            if self._queue_active:
+                self._queue_item_failed(os.path.basename(self._current_filepath), str(e))
+                return
             QMessageBox.critical(self, tr("file_error"), str(e))
+            return
+        if state == "DONE" and cfg.get("diarize") and not service.is_diarized(jid):
+            # Já transcrito, só falta identificar os falantes: o worker faz só essa etapa.
+            self._start_job(jid, resumed=True)
+            return
+        if state == "DONE" and self._queue_active:
+            self._queue_stats["skipped"] += 1
+            self.show_toast(tr("queue_skipped_done", name=os.path.basename(self._current_filepath)), kind="info")
+            QTimer.singleShot(600, self._advance_queue)
             return
         if state == "DONE":
             box = QMessageBox(self)
@@ -749,16 +853,18 @@ class MainWindow(QMainWindow):
         self._start_job(jid, resumed=state != "CREATED")
 
     def _start_job(self, jid: str, resumed: bool):
-        if self._controller.is_running():
+        if self._is_busy():
             return
         self._job_id = jid
         self._job_started_at = time.monotonic()
         existing = service.load_segments(jid) if resumed else []
-        if os.path.normcase(self._doc_src) != os.path.normcase(os.path.normpath(self._current_filepath)):
+        row = service.job(jid)
+        src = os.path.normcase(os.path.normpath(row["src_path"] or ""))
+        if (os.path.normcase(self._doc_src) != src
+                and src == os.path.normcase(os.path.normpath(self._current_filepath or ""))):
             self._on_file_selected_view_only()
         self._result_view.begin_job(jid, existing)
         self._log_panel.clear()
-        row = service.job(jid)
         cfg = json.loads(row["config_json"])
         self._log_panel.append(tr("job_start", name=row["display_name"], model=cfg.get("model_size"),
                                   device=cfg.get("device")))
@@ -785,22 +891,27 @@ class MainWindow(QMainWindow):
         dp, peaks = self._drop_peaks
         self._player_controls.set_peaks(peaks if os.path.normcase(dp) == os.path.normcase(self._doc_src) else None)
 
-    def _set_busy(self, busy: bool):
+    def _is_busy(self) -> bool:
+        return self._controller.is_running() or self._live.is_running()
+
+    def _set_busy(self, busy: bool, live: bool = False):
         self._config_panel.set_transcribing(busy)
         self._dropzone.set_busy(busy)
         self._history_panel.setEnabled(not busy)
         self._recent.setEnabled(not busy)
         self._hero.setEnabled(not busy)
+        self._hero_mic.setEnabled(not busy)
+        self._mic_btn.setEnabled(not busy)
         self._status_dot.setVisible(busy)
-        self._status_dot.set_color_key("accent")
+        self._status_dot.set_color_key("danger" if live else "accent")
         if busy:
-            self._action_stack.set_current(self._progress_area)
+            self._action_stack.set_current(self._live_panel if live else self._progress_area)
         else:
-            QTimer.singleShot(1400, self._restore_action)
+            QTimer.singleShot(1400 if not live else 300, self._restore_action)
 
     def _restore_action(self):
-        if not self._controller.is_running():
-            self._action_stack.set_current(self._config_panel.start_button)
+        if not self._is_busy():
+            self._action_stack.set_current(self._idle_action)
 
     def _on_cancel(self):
         if self._controller.is_running():
@@ -821,8 +932,11 @@ class MainWindow(QMainWindow):
                 self._status_label.setText(tr(key))
             if payload == "TRANSCRIBING" and self._job_id:
                 pa.begin_transcription(service.job_progress(self._job_id))
-        elif kind in ("extract_progress", "plan_progress"):
+        elif kind in ("extract_progress", "plan_progress", "diarize_progress"):
             pa.set_stage_fraction(float(payload or 0))
+        elif kind == "speakers":
+            n = int((payload or {}).get("count") or 0)
+            self._log_panel.append(tr("speakers_found", count=n))
         elif kind == "download_progress":
             done, total = payload.get("done", 0), payload.get("total", 1) or 1
             pa.set_stage(tr("stage_downloading", done=done >> 20, total=total >> 20))
@@ -857,6 +971,7 @@ class MainWindow(QMainWindow):
         self._progress_area.stop()
         self._result_view.end_live()
         elapsed = time.monotonic() - self._job_started_at
+        in_queue = self._queue_active and not self._quitting
         if outcome == "done":
             self._progress_area.set_stage(tr("stage_done"))
             self._progress_area.update_progress(1.0)
@@ -867,17 +982,30 @@ class MainWindow(QMainWindow):
             self._log_panel.append(tr("done_log", elapsed=ProgressArea.format_duration(elapsed),
                                       segments=p.get("segments", "?"), words=p.get("words", "?")) + speed)
             failed = int(p.get("failed_chunks") or 0)
-            if failed:
+            if failed and not in_queue:
                 QMessageBox.warning(self, tr("partial_title"), tr("partial_msg", count=failed))
-            self.show_toast(tr("done_toast", elapsed=ProgressArea.format_duration(elapsed)), kind="success")
+            elif failed:
+                self.show_toast(tr("partial_msg", count=failed)[:140], kind="warning", duration_ms=6000)
+            row = service.job(jid)
+            name = row["display_name"] if row is not None else ""
+            if in_queue:
+                self._queue_stats["done"] += 1
+                self.show_toast(tr("queue_item_done", name=name), kind="success", duration_ms=2600)
+            else:
+                self.show_toast(tr("done_toast", elapsed=ProgressArea.format_duration(elapsed)), kind="success")
             self._status_label.setText(tr("transcription_complete"))
             self._history_panel.refresh()
             self._config_panel.refresh_models()
-            QApplication.alert(self)
+            if in_queue:
+                QTimer.singleShot(1300, self._advance_queue)
+            else:
+                QApplication.alert(self)
         elif outcome == "paused":
             self._progress_area.set_stage(tr("stage_paused"))
             self._log_panel.append(tr("paused_log"))
             self._status_label.setText(tr("paused_status"))
+            if self._queue_active:
+                self._queue_active = False  # pausar também segura a fila
             if not self._quitting:
                 self.show_toast(tr("paused_toast"), kind="info")
         else:
@@ -886,8 +1014,175 @@ class MainWindow(QMainWindow):
             code, msg = p.get("code", "?"), p.get("message", "")
             self._status_label.setText(tr("transcription_failed"))
             log_path = paths.logs_dir() / f"worker-{jid[:12]}.log"
+            if in_queue:
+                row = service.job(jid)
+                self._log_panel.append(tr("failed_msg", code=code, message=msg[:800], log=str(log_path)))
+                self._queue_item_failed(row["display_name"] if row is not None else jid, f"{code}: {msg}")
+                return
             QMessageBox.critical(self, tr("transcription_failed"),
                                  tr("failed_msg", code=code, message=msg[:800], log=str(log_path)))
+
+    # ---------------------------------------------------------------- fila
+    def _on_files_chosen(self, paths_: list[str]):
+        paths_ = [os.path.normpath(x) for x in paths_ if x]
+        if not paths_:
+            return
+        if not self._is_busy() and not self._dropzone.busy:
+            first, rest = paths_[0], paths_[1:]
+            self._dropzone.load_file(first)
+        else:
+            rest = paths_
+        if rest:
+            cur = os.path.normcase(os.path.normpath(self._current_filepath or ""))
+            rest = [x for x in rest if os.path.normcase(x) != cur]
+            n = self._queue.add(rest)
+            if n:
+                self.show_toast(tr("queue_added", count=n), kind="info", duration_ms=2600)
+
+    def _advance_queue(self):
+        if not self._queue_active or self._is_busy() or self._quitting:
+            return
+        nxt = self._queue.pop_next()
+        if nxt is None:
+            self._queue_active = False
+            st = self._queue_stats
+            self.show_toast(tr("queue_finished", done=st["done"], failed=st["failed"]),
+                            kind="success" if not st["failed"] else "warning", duration_ms=6000)
+            self._log_panel.append(tr("queue_finished", done=st["done"], failed=st["failed"]))
+            QApplication.alert(self)
+            return
+        self._log_panel.append(tr("queue_next_log", name=os.path.basename(nxt)))
+        self._pending_queue_start = nxt
+        self._dropzone.load_file(nxt)
+
+    def _queue_item_failed(self, name: str, message: str):
+        self._queue_stats["failed"] += 1
+        self._log_panel.append(f"✖ {name}: {message}")
+        self.show_toast(tr("queue_item_failed", name=name), kind="error", duration_ms=5000)
+        QTimer.singleShot(900, self._advance_queue)
+
+    def _on_load_failed(self, path: str, _msg: str):
+        queued = self._pending_queue_start
+        if queued and os.path.normcase(queued) == os.path.normcase(os.path.normpath(path)):
+            self._pending_queue_start = None
+            self._queue_item_failed(os.path.basename(path), _msg)
+
+    # ---------------------------------------------------------------- falantes (job concluído)
+    def _on_diarize_requested(self, jid: str):
+        if self._is_busy():
+            self.show_toast(tr("busy_cannot_open"), kind="warning")
+            return
+        row = service.job(jid)
+        if row is None:
+            return
+        if not os.path.isfile(row["src_path"] or ""):
+            self.show_toast(tr("speakers_need_source"), kind="warning", duration_ms=6000)
+            return
+        panel = self._config_panel.get_config_dict()
+        cfg = json.loads(row["config_json"] or "{}")
+        cfg.update(diarize=True, num_speakers=panel.get("num_speakers") or 0, speaker_label=tr("speaker_n"))
+        service.journal().update_fields(jid, config_json=json.dumps(cfg), diarized=0)
+        self._start_job(jid, resumed=True)
+
+    # ---------------------------------------------------------------- ao vivo
+    def _on_mic_clicked(self):
+        if self._live.is_running():
+            self._on_live_stop()
+            return
+        if self._controller.is_running():
+            self.show_toast(tr("live_busy"), kind="warning")
+            return
+        dev = find_device(app_config.get("mic_device"))
+        if dev is None or dev.isNull():
+            self.show_toast(tr("live_no_mics"), kind="warning")
+            return
+        cfg = self._config_panel.get_config_dict()
+        if cfg.get("task") == "translate" and cfg.get("model_size") in NO_TRANSLATE:
+            cfg["task"] = "transcribe"
+        if cfg.get("device") == "cuda" and not is_cuda_available():
+            cfg["device"] = "cpu"
+        cfg["diarize"] = False  # a identificação de falantes pode ser feita depois, no resultado
+        app_config.save({**app_config.load(), **self._config_panel.get_config_dict()})
+        try:
+            jid = self._live.start(cfg, dev, tr("recording_prefix"))
+        except Exception as e:  # noqa: BLE001 — mostrado ao usuário
+            log.exception("Falha ao iniciar a gravação")
+            self.show_toast(tr("live_mic_error", error=str(e)[:120]), kind="error", duration_ms=7000)
+            return
+        self._job_id = jid
+        self._job_started_at = time.monotonic()
+        self._retire_wave()
+        self._audio_player.unload()
+        self._player_controls.set_file_loaded(False)
+        self._player_controls.set_message(tr("live_player_msg"))
+        self._set_document(self._live.wav_path, os.path.basename(self._live.wav_path), dev.description())
+        self._result_view.begin_job(jid, [])
+        self._log_panel.clear()
+        self._log_panel.append(tr("live_start_log", device=dev.description(), model=cfg.get("model_size")))
+        self._set_busy(True, live=True)
+        self._live_panel.start(lambda: self._live.elapsed)
+        self._status_label.setText(tr("live_recording"))
+
+    def _on_live_stop(self):
+        if self._live.is_running() and not self._live.is_stopping():
+            self._live.stop()
+            self._live_panel.set_stopping()
+            self._status_label.setText(tr("live_finishing"))
+
+    def _on_live_event(self, kind: str, payload):
+        lp = self._live_panel
+        if kind == "log":
+            self._log_panel.append(str(payload))
+        elif kind == "state":
+            if payload == "LOADING_MODEL":
+                lp.set_status(tr("stage_loading_model"))
+            elif payload == "LIVE":
+                lp.set_status(tr("live_listening"))
+                self._log_panel.append(tr("live_listening"))
+        elif kind == "download_progress":
+            done, total = payload.get("done", 0), payload.get("total", 1) or 1
+            lp.set_status(tr("stage_downloading", done=done >> 20, total=total >> 20))
+        elif kind == "partial":
+            if not self._live.is_stopping() or (payload or {}).get("text") == "":
+                self._result_view.set_partial((payload or {}).get("text", ""))
+        elif kind == "chunk_done":
+            self._result_view.set_partial("")
+            self._result_view.append_segments(payload.get("segments") or [])
+        elif kind == "language":
+            self._log_panel.append(tr("language_detected", code=payload.get("code"),
+                                      prob=f"{float(payload.get('prob', 0)) * 100:.0f}"))
+        elif kind in ("engine", "degraded"):
+            self._log_panel.append(str(payload.get("label", "")))
+        elif kind == "warning":
+            self._log_panel.append(f"⚠ {payload}")
+        elif kind == "error":
+            self._log_panel.append(f"✖ {payload.get('code')}: {payload.get('message')}")
+
+    def _on_live_finished(self, jid: str, outcome: str, payload):
+        wav = self._live.wav_path
+        self._live_panel.stop()
+        self._set_busy(False, live=True)
+        self._result_view.end_live()
+        if self._quitting:
+            return
+        if outcome in ("done", "cancelled") and discard_empty(jid, wav):
+            self.show_toast(tr("live_empty"), kind="info")
+            self._result_view.clear()
+            if self._current_filepath and os.path.isfile(self._current_filepath):
+                self._on_file_selected_view_only()
+            else:
+                self._show_empty()
+            self._status_label.setText(tr("ready"))
+            return
+        if outcome == "failed":
+            p = payload or {}
+            self.show_toast(tr("live_failed", error=f"{p.get('code', '?')}: {p.get('message', '')}"[:140]),
+                            kind="error", duration_ms=8000)
+        else:
+            self.show_toast(tr("live_saved", time=ProgressArea.format_duration(self._live.elapsed)), kind="success")
+        self._show_job(jid)
+        self._history_panel.refresh()
+        self._status_label.setText(tr("transcription_complete"))
 
     @staticmethod
     def _job_meta(row) -> str:
@@ -932,7 +1227,7 @@ class MainWindow(QMainWindow):
 
     # ================================================================ histórico/player
     def _on_history_entry_selected(self, jid: str):
-        if self._controller.is_running():
+        if self._is_busy():
             self.show_toast(tr("busy_cannot_open"), kind="warning")
             return
         row = service.job(jid)
@@ -978,13 +1273,17 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
         if path and os.path.isfile(path):
-            if self._controller.is_running():
-                self.show_toast(tr("busy_cannot_open"), kind="warning")
-            else:
-                self._dropzone.load_file(path)
+            self._on_files_chosen([path])
 
     # ================================================================ fechamento
     def closeEvent(self, event):
+        if self._live.is_running():
+            self._quitting = True
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                self._live.shutdown()
+            finally:
+                QApplication.restoreOverrideCursor()
         if self._controller.is_running():
             r = QMessageBox.question(self, tr("quit_title"), tr("quit_running_msg"),
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,

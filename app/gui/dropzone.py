@@ -4,6 +4,7 @@ thread da GUI. O arrastar-e-soltar é tratado pela janela inteira (MainWindow), 
 from __future__ import annotations
 
 import os
+import warnings
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import QComboBox, QFileDialog, QHBoxLayout, QLabel, QVBoxLayout, QWidget
@@ -68,6 +69,8 @@ class DropZone(QWidget):
     stream_changed = Signal(int)          # índice absoluto da trilha escolhida
     peaks_changed = Signal(object)        # np.ndarray 0..1, ou None enquanto calcula
     peaks_failed = Signal(str)
+    files_chosen = Signal(list)           # vários arquivos escolhidos de uma vez (fila)
+    load_failed = Signal(str, str)        # (caminho, mensagem)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -187,15 +190,21 @@ class DropZone(QWidget):
 
     # --------------------------------------------------------------- carga
     def _on_select_file(self):
-        if self._busy:
+        self.choose_files(allow_busy=False)
+
+    def choose_files(self, allow_busy: bool = False):
+        """Diálogo de abertura com seleção múltipla: um arquivo carrega; vários vão para a fila."""
+        if self._busy and not allow_busy:
             return
         exts = " ".join(f"*{e}" for e in sorted(SUPPORTED_EXTENSIONS))
         start_dir = os.path.dirname(self._current_filepath) if self._current_filepath else ""
-        filepath, _ = QFileDialog.getOpenFileName(
+        files, _ = QFileDialog.getOpenFileNames(
             self, tr("select_file_dialog"), start_dir,
             f"{tr('media_files')} ({exts});;{tr('all_files')} (*)")
-        if filepath:
-            self.load_file(filepath)
+        if len(files) > 1 or (files and self._busy):
+            self.files_chosen.emit([os.path.normpath(f) for f in files])
+        elif files:
+            self.load_file(files[0])
 
     def load_file(self, filepath: str, preferred_stream: int | None = None):
         if self._busy:
@@ -203,6 +212,7 @@ class DropZone(QWidget):
         filepath = os.path.normpath(filepath)
         if not os.path.isfile(filepath):
             self._toast(tr("file_not_found", path=filepath))
+            self.load_failed.emit(filepath, tr("file_not_found", path=filepath))
             return
         self._retire(self._probe)
         self._preferred_stream = preferred_stream
@@ -221,6 +231,7 @@ class DropZone(QWidget):
             return
         self._restore_page()
         self._toast(f"{os.path.basename(path)}: {msg}"[:220])
+        self.load_failed.emit(os.path.normpath(path), msg)
 
     @staticmethod
     def _meta_text(path: str, info: ProbeInfo) -> str:
@@ -285,11 +296,13 @@ class DropZone(QWidget):
             return
         if hasattr(worker, "cancel"):
             worker.cancel()
-        for sig in ("ok", "failed", "peaks_ready", "waveform_error", "waveform_ready"):
-            try:
-                getattr(worker, sig).disconnect()
-            except (AttributeError, RuntimeError, TypeError):
-                pass
+        with warnings.catch_warnings():  # desconectar um sinal sem conexões só gera aviso
+            warnings.simplefilter("ignore", RuntimeWarning)
+            for sig in ("ok", "failed", "peaks_ready", "waveform_error", "waveform_ready"):
+                try:
+                    getattr(worker, sig).disconnect()
+                except (AttributeError, RuntimeError, TypeError):
+                    pass
         if worker.isRunning():
             self._old_workers.append(worker)
             worker.finished.connect(lambda w=worker: self._old_workers.remove(w) if w in self._old_workers else None)

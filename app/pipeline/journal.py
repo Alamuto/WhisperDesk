@@ -19,7 +19,7 @@ from typing import Iterator
 
 from app.pipeline import ENGINE_VERSION
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_CHUNK_ATTEMPTS = 3
 
 SCHEMA = """
@@ -97,12 +97,21 @@ CREATE TABLE IF NOT EXISTS word (
 );
 """
 
+# v2: edição manual de trechos (texto original preservado) e marca de diarização no job.
+MIGRATIONS = {
+    2: (
+        "ALTER TABLE segment ADD COLUMN orig_text TEXT",
+        "ALTER TABLE segment ADD COLUMN orig_words TEXT",
+        "ALTER TABLE job ADD COLUMN diarized INTEGER NOT NULL DEFAULT 0",
+    ),
+}
+
 RELEVANT_CONFIG_KEYS = (
     "model_size", "language", "task", "beam_size", "vad_filter", "audio_stream", "engine_version",
 )
 
 # Estados terminais / retomáveis
-ACTIVE_STATES = ("CREATED", "EXTRACTING", "PLANNING", "TRANSCRIBING", "POSTPROCESSING", "PAUSED")
+ACTIVE_STATES = ("CREATED", "EXTRACTING", "PLANNING", "TRANSCRIBING", "POSTPROCESSING", "DIARIZING", "PAUSED")
 TERMINAL_STATES = ("DONE", "FAILED")
 
 
@@ -163,6 +172,13 @@ class Journal:
         ver = self.conn.execute("PRAGMA user_version").fetchone()[0]
         if ver < SCHEMA_VERSION:
             self.conn.executescript(SCHEMA)
+            for v in range(max(ver, 1) + 1, SCHEMA_VERSION + 1):
+                for stmt in MIGRATIONS.get(v, ()):
+                    try:
+                        self.conn.execute(stmt)
+                    except sqlite3.OperationalError as e:  # coluna já existe (migração interrompida)
+                        if "duplicate column" not in str(e).lower():
+                            raise
             self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def close(self) -> None:
@@ -289,6 +305,12 @@ class Journal:
                 [(job_id, p.idx, p.start, p.end, p.pad_left, p.pad_right) for p in plans],
             )
 
+    def add_chunk(self, job_id, idx: int, start_sample: int, end_sample: int) -> None:
+        """Acrescenta um chunk ao plano (modo ao vivo: o plano cresce a cada fala)."""
+        self.conn.execute(
+            "INSERT OR IGNORE INTO chunk(job_id, idx, start_sample, end_sample, pad_left, pad_right) "
+            "VALUES (?,?,?,?,0,0)", (job_id, idx, int(start_sample), int(end_sample)))
+
     def reset_running(self, job_id) -> int:
         """Chunks 'running' de um processo que morreu: voltam a 'pending', ou 'failed' se excederam tentativas."""
         with self.tx() as c:
@@ -399,12 +421,111 @@ class Journal:
             words.setdefault((r[0], r[1]), []).append((r[2], r[3], r[4], r[5]))
         out = []
         for r in self.conn.execute(
-                "SELECT chunk_idx, seq, start_ms, end_ms, text, avg_logprob, speaker FROM segment "
+                "SELECT chunk_idx, seq, start_ms, end_ms, text, avg_logprob, speaker, orig_text FROM segment "
                 "WHERE job_id=? ORDER BY chunk_idx, seq", (job_id,)):
             out.append({"start_ms": r[2], "end_ms": r[3], "text": r[4], "avg_logprob": r[5],
-                        "speaker": r[6], "words": words.get((r[0], r[1]), [])})
+                        "speaker": r[6], "words": words.get((r[0], r[1]), []),
+                        "key": (r[0], r[1]), "edited": r[7] is not None})
         out.sort(key=lambda s: s["start_ms"])
         return out
+
+    # ---------- edição e falantes ----------
+    def segment_keys(self, job_id) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT chunk_idx, seq, start_ms, end_ms FROM segment WHERE job_id=? ORDER BY start_ms, chunk_idx, seq",
+            (job_id,))]
+
+    def set_speakers(self, job_id, assignments: list[tuple[int, int, str | None]]) -> None:
+        """assignments: [(chunk_idx, seq, rótulo)]. Marca o job como diarizado."""
+        with self.tx() as c:
+            c.execute("UPDATE segment SET speaker=NULL WHERE job_id=?", (job_id,))
+            c.executemany("UPDATE segment SET speaker=? WHERE job_id=? AND chunk_idx=? AND seq=?",
+                          [(sp, job_id, ci, sq) for ci, sq, sp in assignments])
+            c.execute("UPDATE job SET diarized=?, updated_at=? WHERE id=?",
+                      (1 if assignments else 0, time.time(), job_id))
+
+    def speakers(self, job_id) -> list[str]:
+        """Falantes na ordem da primeira fala."""
+        rows = self.conn.execute(
+            "SELECT speaker, MIN(start_ms) t FROM segment WHERE job_id=? AND speaker IS NOT NULL "
+            "GROUP BY speaker ORDER BY t", (job_id,)).fetchall()
+        return [r[0] for r in rows]
+
+    def rename_speaker(self, job_id, old: str, new: str) -> int:
+        new = new.strip()
+        if not new or new == old:
+            return 0
+        with self.tx() as c:
+            cur = c.execute("UPDATE segment SET speaker=? WHERE job_id=? AND speaker=?", (new, job_id, old))
+            c.execute("UPDATE job SET updated_at=? WHERE id=?", (time.time(), job_id))
+            return cur.rowcount
+
+    def set_segment_speaker(self, job_id, key: tuple[int, int], speaker: str | None) -> None:
+        self.conn.execute("UPDATE segment SET speaker=? WHERE job_id=? AND chunk_idx=? AND seq=?",
+                          (speaker, job_id, key[0], key[1]))
+
+    def edit_segment(self, job_id, key: tuple[int, int], text: str, words: list[tuple]) -> None:
+        """Substitui o texto (e as palavras realinhadas) de um trecho, preservando o original na 1ª edição."""
+        ci, sq = key
+        with self.tx() as c:
+            row = c.execute("SELECT text, orig_text FROM segment WHERE job_id=? AND chunk_idx=? AND seq=?",
+                            (job_id, ci, sq)).fetchone()
+            if row is None:
+                raise KeyError(key)
+            if row["orig_text"] is None:
+                old = c.execute("SELECT start_ms, end_ms, word, prob FROM word WHERE job_id=? AND chunk_idx=? "
+                                "AND seg_seq=? ORDER BY seq", (job_id, ci, sq)).fetchall()
+                c.execute("UPDATE segment SET orig_text=?, orig_words=? WHERE job_id=? AND chunk_idx=? AND seq=?",
+                          (row["text"], json.dumps([tuple(w) for w in old], ensure_ascii=False), job_id, ci, sq))
+            self._replace_words(c, job_id, ci, sq, text, words)
+
+    def restore_segment(self, job_id, key: tuple[int, int]) -> bool:
+        ci, sq = key
+        with self.tx() as c:
+            row = c.execute("SELECT orig_text, orig_words FROM segment WHERE job_id=? AND chunk_idx=? AND seq=?",
+                            (job_id, ci, sq)).fetchone()
+            if row is None or row["orig_text"] is None:
+                return False
+            words = [tuple(w) for w in json.loads(row["orig_words"] or "[]")]
+            self._replace_words(c, job_id, ci, sq, row["orig_text"], words)
+            c.execute("UPDATE segment SET orig_text=NULL, orig_words=NULL WHERE job_id=? AND chunk_idx=? AND seq=?",
+                      (job_id, ci, sq))
+            return True
+
+    @staticmethod
+    def _replace_words(c, job_id, ci, sq, text, words):
+        c.execute("UPDATE segment SET text=? WHERE job_id=? AND chunk_idx=? AND seq=?", (text, job_id, ci, sq))
+        c.execute("DELETE FROM word WHERE job_id=? AND chunk_idx=? AND seg_seq=?", (job_id, ci, sq))
+        c.executemany(
+            "INSERT INTO word(job_id, chunk_idx, seg_seq, seq, start_ms, end_ms, word, prob) VALUES (?,?,?,?,?,?,?,?)",
+            [(job_id, ci, sq, i, int(w[0]), int(w[1]), w[2], float(w[3])) for i, w in enumerate(words)])
+        c.execute("UPDATE job SET updated_at=? WHERE id=?", (time.time(), job_id))
+
+
+def realign_words(old_words: list[tuple], new_text: str, start_ms: int, end_ms: int) -> list[tuple]:
+    """Gera palavras com tempo para um texto editado.
+
+    Mesmo número de palavras: mantém os tempos originais (correção de grafia, o caso comum).
+    Caso contrário: distribui o intervalo do trecho proporcionalmente ao tamanho de cada palavra,
+    respeitando o início e o fim reais da fala quando há palavras originais.
+    """
+    toks = new_text.split()
+    if not toks:
+        return []
+    if old_words and len(old_words) == len(toks):
+        return [(w[0], w[1], " " + t, w[3] if w[2].strip() == t else 1.0) for w, t in zip(old_words, toks)]
+    a = int(old_words[0][0]) if old_words else int(start_ms)
+    b = int(old_words[-1][1]) if old_words else int(end_ms)
+    b = max(b, a + 10 * len(toks))
+    weights = [len(t) + 1 for t in toks]
+    total = sum(weights)
+    out, acc = [], 0
+    for t, w in zip(toks, weights):
+        s = a + (b - a) * acc // total
+        acc += w
+        e = a + (b - a) * acc // total
+        out.append((s, e, " " + t, 1.0))
+    return out
 
 
 class Heartbeat:

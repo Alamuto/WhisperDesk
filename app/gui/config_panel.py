@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel, QS
 
 from app import paths
 from app.core.gpu_monitor import is_cuda_available
-from app.gui.widgets import Collapsible, PrimaryButton, SegmentedControl, SwitchRow
+from app.gui.widgets import Collapsible, PrimaryButton, Reveal, SegmentedControl, SwitchRow
 from app.pipeline.models import (
     MODEL_DOWNLOAD_MB, MODEL_LIST, MODEL_SPEED_ESTIMATE, NO_TRANSLATE, estimate_vram_mb, is_model_ready,
 )
@@ -146,6 +146,27 @@ class ConfigPanel(QWidget):
             self._device_seg.set_current("cpu", animate=False)
         lay.addLayout(_field(self._device_label, self._device_seg))
 
+        # Falantes (diarização): o seletor de quantidade surge suavemente quando ativado
+        spk = QVBoxLayout()
+        spk.setSpacing(8)
+        self._diar_row = SwitchRow(tr("diarize"), tr("diarize_desc"))
+        self._diar_row.setToolTip(tr("diarize_tip"))
+        spk.addWidget(self._diar_row)
+        count_w = QWidget()
+        count_w.setObjectName("transparent")
+        count_lay = QVBoxLayout(count_w)
+        count_lay.setContentsMargins(0, 2, 0, 0)
+        count_lay.setSpacing(6)
+        self._spk_label = _label(tr("num_speakers"))
+        self._spk_seg = SegmentedControl([("0", tr("auto_short")), ("2", "2"), ("3", "3"), ("4", "4"), ("5", "5")])
+        self._spk_seg.setToolTip(tr("num_speakers_tip"))
+        count_lay.addWidget(self._spk_label)
+        count_lay.addWidget(self._spk_seg)
+        self._spk_reveal = Reveal(count_w)
+        spk.addWidget(self._spk_reveal)
+        self._diar_row.toggled.connect(lambda on: self._spk_reveal.set_shown(on))
+        lay.addLayout(spk)
+
         # Avançado
         self._advanced = Collapsible(tr("advanced"))
         cl = self._advanced.content_layout
@@ -220,6 +241,11 @@ class ConfigPanel(QWidget):
         self._device_seg.setToolTip(tr("device_tip"))
         if not self._cuda:
             self._device_seg.set_option_enabled("cuda", False, tr("gpu_cpu_mode"))
+        self._diar_row.set_texts(tr("diarize"), tr("diarize_desc"))
+        self._diar_row.setToolTip(tr("diarize_tip"))
+        self._spk_label.setText(tr("num_speakers"))
+        self._spk_seg.set_labels([tr("auto_short"), "2", "3", "4", "5"])
+        self._spk_seg.setToolTip(tr("num_speakers_tip"))
         self._advanced.set_title(tr("advanced"))
         self._vad_row.set_texts(tr("vad_short"), tr("vad_desc"))
         self._vad_row.setToolTip(tr("vad_tip"))
@@ -256,7 +282,15 @@ class ConfigPanel(QWidget):
         self._vad_row.setChecked(bool(cfg.get("vad_filter", True)))
         self._beam_spin.setValue(int(cfg.get("beam_size", 5)))
         self._temp_spin.setValue(float(cfg.get("temperature", 0.0)))
+        self._apply_speakers(cfg, animate=False)
         self._on_model_changed()
+
+    def _apply_speakers(self, cfg: dict, animate: bool = True):
+        on = bool(cfg.get("diarize", False))
+        self._diar_row.setChecked(on)
+        n = str(int(cfg.get("num_speakers") or 0))
+        self._spk_seg.set_current(n if n in ("0", "2", "3", "4", "5") else "0", animate=animate)
+        self._spk_reveal.set_shown(on, animate=animate)
 
     def get_config_dict(self) -> dict:
         return {
@@ -268,6 +302,9 @@ class ConfigPanel(QWidget):
             "vad_filter": self._vad_row.isChecked(),
             "beam_size": self._beam_spin.value(),
             "temperature": self._temp_spin.value(),
+            "diarize": self._diar_row.isChecked(),
+            "num_speakers": int(self._spk_seg.current()) if self._diar_row.isChecked() else 0,
+            "speaker_label": tr("speaker_n"),
         }
 
     def _populate_models(self):
@@ -324,9 +361,15 @@ class ConfigPanel(QWidget):
             b.setText(tr("transcribing"))
             b.setEnabled(False)
         else:
-            b.setText(tr("transcribe_action"))
-            b.setEnabled(self._file_loaded)
-            b.setToolTip("" if self._file_loaded else tr("no_file_msg"))
+            q = getattr(self, "_queue_count", 0)
+            total = q + (1 if self._file_loaded else 0)
+            b.setText(tr("transcribe_n_files", count=total) if total > 1 else tr("transcribe_action"))
+            b.setEnabled(total > 0)
+            b.setToolTip("" if total else tr("no_file_msg"))
+
+    def set_queue_count(self, n: int):
+        self._queue_count = int(n)
+        self._update_button()
 
     def set_file_loaded(self, loaded: bool):
         self._file_loaded = loaded
@@ -335,7 +378,8 @@ class ConfigPanel(QWidget):
     def set_transcribing(self, active: bool):
         self._is_transcribing = active
         for w in (self._model_combo, self._lang_combo, self._task_seg, self._device_seg,
-                  self._compute_combo, self._vad_row, self._beam_spin, self._temp_spin):
+                  self._compute_combo, self._vad_row, self._beam_spin, self._temp_spin,
+                  self._diar_row, self._spk_seg):
             w.setEnabled(not active)
         self._update_button()
 
@@ -352,6 +396,7 @@ class ConfigPanel(QWidget):
         self._vad_row.setChecked(bool(cfg.get("vad_filter", True)))
         self._beam_spin.setValue(int(cfg.get("beam_size") or 5))
         self._temp_spin.setValue(float(cfg.get("temperature") or 0.0))
+        self._apply_speakers(cfg)
         self._on_model_changed()
 
     def _on_start(self):

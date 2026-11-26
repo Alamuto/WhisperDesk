@@ -665,6 +665,65 @@ class Collapsible(QWidget):
                              finished=lambda: self.content.setVisible(self.header.isChecked()))
 
 
+class Reveal(QWidget):
+    """Envolve um widget e o mostra/oculta com altura + opacidade (entrada e saída suaves).
+    O efeito de opacidade só existe durante a animação."""
+
+    def __init__(self, child: QWidget, shown: bool = False, parent=None):
+        super().__init__(parent)
+        self.setObjectName("transparent")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.child = child
+        lay.addWidget(child)
+        self._shown = shown
+        self.setMaximumHeight(QWIDGETSIZE_MAX if shown else 0)
+        self.setVisible(shown)
+
+    def is_shown(self) -> bool:
+        return self._shown
+
+    def _effect(self, start: float) -> QGraphicsOpacityEffect:
+        fx = self.child.graphicsEffect()
+        if not isinstance(fx, QGraphicsOpacityEffect):
+            fx = QGraphicsOpacityEffect(self.child)
+            fx.setOpacity(start)
+            self.child.setGraphicsEffect(fx)
+        return fx
+
+    def set_shown(self, on: bool, animate: bool = True, finished=None):
+        if on == self._shown:
+            if finished:
+                finished()
+            return
+        self._shown = on
+        if not animate or not self.window().isVisible():
+            self._settle(finished)
+            return
+        target = max(1, self.child.sizeHint().height())
+        if on:
+            self.setVisible(True)
+            fx = self._effect(0.0)
+            animate_property(self, b"maximumHeight", self.height() if self.maximumHeight() else 0, target, 260,
+                             finished=lambda: self._settle(finished))
+            animate_property(fx, b"opacity", fx.opacity(), 1.0, 320)
+        else:
+            fx = self._effect(1.0)
+            animate_property(self, b"maximumHeight", self.height(), 0, 220, QEasingCurve.Type.InOutCubic,
+                             finished=lambda: self._settle(finished))
+            animate_property(fx, b"opacity", fx.opacity(), 0.0, 160)
+
+    def _settle(self, finished=None):
+        try:
+            self.child.setGraphicsEffect(None)
+        except RuntimeError:
+            return
+        self.setMaximumHeight(QWIDGETSIZE_MAX if self._shown else 0)
+        self.setVisible(self._shown)
+        if finished:
+            finished()
+
+
 class FadeStack(QStackedWidget):
     """QStackedWidget com transição: a nova página surge com fade e um leve deslize vertical."""
 
