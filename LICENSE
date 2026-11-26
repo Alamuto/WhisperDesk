@@ -19,9 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-Third-party components bundled in the distributed builds (FFmpeg, Qt/PySide6,
-CTranslate2, faster-whisper, NVIDIA CUDA libraries and others) keep their own
-licenses. See packaging/THIRD_PARTY_NOTICES.txt.
