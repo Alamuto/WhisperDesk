@@ -186,7 +186,7 @@ def _measure_duration(container, index: int) -> float:
 def _downmix_filter(stream: AudioStream) -> tuple[str, str]:
     """Prioriza o canal central (diálogo) em 5.1/6.1/7.1; downmix padrão nos demais."""
     if stream.channels >= 6 and stream.layout.split("(")[0] in {"5.1", "6.1", "7.1"}:
-        return "pan", "mono|c0=0.60*FC+0.20*FL+0.20*FR"
+        return "pan", "mono|c0<3*FC+FL+FR"   # "<" normaliza: 0,6·FC + 0,2·FL + 0,2·FR, sem decimais (locale)
     return "aformat", "channel_layouts=mono"
 
 
