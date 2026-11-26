@@ -8,6 +8,11 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag de um release existente para gerar e anexar os pacotes (ex.: v2.2.0)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -19,6 +24,7 @@ concurrency:
 env:
   PYTHONIOENCODING: utf-8
   QT_QPA_PLATFORM: offscreen
+  RELEASE_TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/v') && github.ref_name) || '' }}
 
 jobs:
   build:
@@ -33,7 +39,7 @@ jobs:
           - name: Linux x64
             os: ubuntu-22.04
           - name: macOS arm64
-            os: macos-14
+            os: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -64,7 +70,7 @@ jobs:
         run: python main.py --selftest
 
       - name: Build (Windows)
-        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        if: runner.os == 'Windows' && env.RELEASE_TAG != ''
         shell: cmd
         run: |
           choco install innosetup -y --no-progress
@@ -73,7 +79,7 @@ jobs:
           build.bat --skip-tests
 
       - name: Build (Linux/macOS)
-        if: runner.os != 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        if: runner.os != 'Windows' && env.RELEASE_TAG != ''
         run: |
           python -m venv .venv
           .venv/bin/python -m pip install -r requirements-dev.txt
@@ -81,7 +87,7 @@ jobs:
           ./build.sh --skip-tests
 
       - name: Coletar pacotes
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: env.RELEASE_TAG != ''
         shell: bash
         run: |
           mkdir -p out
@@ -92,7 +98,7 @@ jobs:
           cat SHA256SUMS-*.txt
 
       - uses: actions/upload-artifact@v4
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: env.RELEASE_TAG != ''
         with:
           name: WhisperDesk-${{ runner.os }}
           path: out/*
@@ -100,7 +106,7 @@ jobs:
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: inputs.tag != '' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -112,7 +118,7 @@ jobs:
       - name: Anexar ao release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ env.RELEASE_TAG }}
         run: |
           gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "WhisperDesk ${TAG#v}" --notes "Pacotes gerados pelo CI."

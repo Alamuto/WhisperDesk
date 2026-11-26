@@ -221,7 +221,8 @@ def test_queue_list_add_remove_persist(qapp, tmp_path):
     counts = []
     q.changed.connect(counts.append)
     assert q.add(files) == 3
-    assert q.add([files[0].upper()]) == 0          # sem duplicatas (caminho sem diferenciar maiúsculas)
+    dup = files[0].upper() if os.name == "nt" else files[0]   # só o Windows não diferencia maiúsculas
+    assert q.add([dup]) == 0                        # sem duplicatas
     assert len(q) == 3 and app_config.get("queue") == [os.path.normpath(f) for f in files]
     q.remove(files[1])
     assert q.items() == [os.path.normpath(files[0]), os.path.normpath(files[2])]
